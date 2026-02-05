@@ -1,10 +1,10 @@
 import builtins
+import copy
 import datetime
 import os
 import time
 from collections import defaultdict, deque
 from pathlib import Path
-import copy
 
 import torch
 import torch.distributed as dist
@@ -256,7 +256,7 @@ def save_model(args, model_without_ddp, optimizer, epoch, epoch_name=None):
     if epoch_name is None:
         epoch_name = str(epoch)
     output_dir = Path(args.output_dir)
-    checkpoint_path = output_dir / ('checkpoint-%s.pth' % epoch_name)
+    checkpoint_path = output_dir / 'checkpoints' / ('checkpoint-%s.pth' % epoch_name)
 
     to_save = {
         'model': model_without_ddp.state_dict(),

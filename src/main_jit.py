@@ -1,23 +1,26 @@
 import argparse
+import copy
 import datetime
-import numpy as np
 import os
+import random
 import time
 from pathlib import Path
 
+import autorootcwd
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
-import torchvision.transforms as transforms
 import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+from natsort import natsorted
+from PIL import Image
+from torch.utils.tensorboard import SummaryWriter
 
-from util.crop import center_crop_arr
 import util.misc as misc
-
-import copy
-from engine_jit import train_one_epoch, evaluate
-
 from denoiser import Denoiser
+from engine_jit import evaluate, train_one_epoch
+from util.crop import center_crop_arr
+from util.octadataset import OCTASegmentationDataset, get_octa_transform
 
 
 def get_args_parser():
@@ -29,6 +32,8 @@ def get_args_parser():
     parser.add_argument('--img_size', default=256, type=int, help='Image size')
     parser.add_argument('--attn_dropout', type=float, default=0.0, help='Attention dropout rate')
     parser.add_argument('--proj_dropout', type=float, default=0.0, help='Projection dropout rate')
+    parser.add_argument('--img_channel', type=int, default=3, help='Number of image channels')
+    parser.add_argument('--mask_channel', type=int, default=1, help='Number of mask channels')
 
     # training
     parser.add_argument('--epochs', default=200, type=int)
@@ -76,28 +81,26 @@ def get_args_parser():
                         help='CFG interval min')
     parser.add_argument('--interval_max', default=1.0, type=float,
                         help='CFG interval max')
-    parser.add_argument('--num_images', default=50000, type=int,
-                        help='Number of images to generate')
-    parser.add_argument('--eval_freq', type=int, default=40,
+    parser.add_argument('--eval_freq', type=int, default=100,
                         help='Frequency (in epochs) for evaluation')
     parser.add_argument('--online_eval', action='store_true')
-    parser.add_argument('--evaluate_gen', action='store_true')
-    parser.add_argument('--gen_bsz', type=int, default=256,
-                        help='Generation batch size')
+    parser.add_argument('--threshold', default=0.5, type=float,
+                        help='Threshold for binary segmentation metrics')
 
     # dataset
-    parser.add_argument('--data_path', default='./data/imagenet', type=str,
+    parser.add_argument('--dataset', default='OCTA500_6M', type=str,
+                        help='Dataset name')
+    parser.add_argument('--data_path', default='data/OCTA500_6M', type=str,
                         help='Path to the dataset')
-    parser.add_argument('--class_num', default=1000, type=int)
 
     # checkpointing
-    parser.add_argument('--output_dir', default='./output_dir',
+    parser.add_argument('--output_dir', default='outputs',
                         help='Directory to save outputs (empty for no saving)')
     parser.add_argument('--resume', default='',
                         help='Folder that contains checkpoint to resume from')
     parser.add_argument('--save_last_freq', type=int, default=5,
                         help='Frequency (in epochs) to save checkpoints')
-    parser.add_argument('--log_freq', default=100, type=int)
+    parser.add_argument('--log_freq', default=50, type=int)
     parser.add_argument('--device', default='cuda',
                         help='Device to use for training/testing')
 
@@ -130,26 +133,53 @@ def main(args):
     global_rank = misc.get_rank()
 
     # Set up TensorBoard logging (only on main process)
+    args.output_dir = os.path.join(args.output_dir, f"{args.model.replace('/', '-')}-{args.dataset}")
+    checkpoint_dir = os.path.join(args.output_dir, 'checkpoints')
+    tensorboard_dir = os.path.join(args.output_dir, 'tensorboard')
+    if misc.is_main_process():
+        os.makedirs(checkpoint_dir, exist_ok=True)
     if global_rank == 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.output_dir)
+        log_writer = SummaryWriter(log_dir=tensorboard_dir)
     else:
         log_writer = None
 
     # Data augmentation transforms
-    transform_train = transforms.Compose([
-        transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.PILToTensor()
-    ])
+    transform_train, transform_val, _ = get_octa_transform(image_size=args.img_size)
 
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    print(dataset_train)
+    # Load dataset - support both ImageFolder and OCTA segmentation formats
+    train_path = os.path.join(args.data_path, 'train')
+    val_path = os.path.join(args.data_path, 'val')
+
+    if 'OCTA' in args.dataset:
+        # OCTA segmentation dataset format
+        dataset_train = OCTASegmentationDataset(
+            train_path,
+            img_size=args.img_size,
+            transform=transform_train,
+        )
+        dataset_val = OCTASegmentationDataset(
+            val_path,
+            img_size=args.img_size,
+            transform=transform_val,
+        )
+        print(f"Loaded OCTA training dataset with {len(dataset_train)} images")
+        print(f"Loaded OCTA validation dataset with {len(dataset_val)} images")
+    else:
+        # ImageFolder format
+        dataset_train = datasets.ImageFolder(train_path, transform=transform_train)
+        dataset_val = datasets.ImageFolder(val_path, transform=transform_val)
+        print(dataset_train)
+        print(dataset_val)
 
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
     )
+    sampler_val = torch.utils.data.DistributedSampler(
+        dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
+    )
     print("Sampler_train =", sampler_train)
+    print("Sampler_val =", sampler_val)
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
@@ -157,6 +187,14 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True
+    )
+
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_val, sampler=sampler_val,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=False
     )
 
     torch._dynamo.config.cache_size_limit = 128
@@ -188,16 +226,23 @@ def main(args):
     print(optimizer)
 
     # Resume from checkpoint if provided
-    checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth") if args.resume else None
+    checkpoint_path = os.path.join(checkpoint_dir, "checkpoint-last.pth")
+
+    # If checkpoint-last.pth doesn't exist, find the latest .pth file
+    if not os.path.exists(checkpoint_path) and os.path.isdir(checkpoint_dir):
+        pth_files = natsorted([f for f in os.listdir(checkpoint_dir) if f.endswith('.pth')])
+        if pth_files:
+            checkpoint_path = os.path.join(checkpoint_dir, pth_files[-1])
+
     if checkpoint_path and os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         model_without_ddp.load_state_dict(checkpoint['model'])
 
         ema_state_dict1 = checkpoint['model_ema1']
         ema_state_dict2 = checkpoint['model_ema2']
         model_without_ddp.ema_params1 = [ema_state_dict1[name].cuda() for name, _ in model_without_ddp.named_parameters()]
         model_without_ddp.ema_params2 = [ema_state_dict2[name].cuda() for name, _ in model_without_ddp.named_parameters()]
-        print("Resumed checkpoint from", args.resume)
+        print("Resumed checkpoint from", checkpoint_path)
 
         if 'optimizer' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -208,15 +253,6 @@ def main(args):
         model_without_ddp.ema_params1 = copy.deepcopy(list(model_without_ddp.parameters()))
         model_without_ddp.ema_params2 = copy.deepcopy(list(model_without_ddp.parameters()))
         print("Training from scratch")
-
-    # Evaluate generation
-    if args.evaluate_gen:
-        print("Evaluating checkpoint at {} epoch".format(args.start_epoch))
-        with torch.random.fork_rng():
-            torch.manual_seed(seed)
-            with torch.no_grad():
-                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
-        return
 
     # Training loop
     print(f"Start training for {args.epochs} epochs")
@@ -237,7 +273,7 @@ def main(args):
                 epoch_name="last"
             )
 
-        if epoch % 100 == 0 and epoch > 0:
+        if epoch % 500 == 0 and epoch > 0:
             misc.save_model(
                 args=args,
                 model_without_ddp=model_without_ddp,
@@ -245,11 +281,11 @@ def main(args):
                 epoch=epoch
             )
 
-        # Perform online evaluation at specified intervals
+        # Perform validation at specified intervals
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             with torch.no_grad():
-                evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(model_without_ddp, data_loader_val, device, epoch, log_writer=log_writer, threshold=args.threshold)
             torch.cuda.empty_cache()
 
         if misc.is_main_process() and log_writer is not None:

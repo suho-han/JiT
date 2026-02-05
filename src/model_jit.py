@@ -3,11 +3,13 @@
 # SiT: https://github.com/willisma/SiT
 # Lightning-DiT: https://github.com/hustvl/LightningDiT
 # --------------------------------------------------------
+import math
+
 import torch
 import torch.nn as nn
-import math
 import torch.nn.functional as F
-from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
+
+from util.model_util import RMSNorm, VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed
 
 
 def modulate(x, shift, scale):
@@ -75,20 +77,6 @@ class TimestepEmbedder(nn.Module):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
-
-
-class LabelEmbedder(nn.Module):
-    """
-    Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
-    """
-    def __init__(self, num_classes, hidden_size):
-        super().__init__()
-        self.embedding_table = nn.Embedding(num_classes + 1, hidden_size)
-        self.num_classes = num_classes
-
-    def forward(self, labels):
-        embeddings = self.embedding_table(labels)
-        return embeddings
 
 
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
@@ -211,34 +199,35 @@ class JiT(nn.Module):
         input_size=256,
         patch_size=16,
         in_channels=3,
+        cond_channels=0,
+        out_channels=None,
         hidden_size=1024,
         depth=24,
         num_heads=16,
         mlp_ratio=4.0,
         attn_drop=0.0,
         proj_drop=0.0,
-        num_classes=1000,
         bottleneck_dim=128,
         in_context_len=32,
         in_context_start=8
     ):
         super().__init__()
         self.in_channels = in_channels
-        self.out_channels = in_channels
+        self.cond_channels = cond_channels
+        self.out_channels = out_channels if out_channels is not None else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.hidden_size = hidden_size
         self.input_size = input_size
         self.in_context_len = in_context_len
         self.in_context_start = in_context_start
-        self.num_classes = num_classes
 
-        # time and class embed
+        # time embed
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size)
 
         # linear embed
-        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True)
+        embed_in_channels = in_channels + cond_channels
+        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, embed_in_channels, bottleneck_dim, hidden_size, bias=True)
 
         # use fixed sin-cos embedding
         num_patches = self.x_embedder.num_patches
@@ -296,9 +285,6 @@ class JiT(nn.Module):
         nn.init.xavier_uniform_(w2.view([w2.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj2.bias, 0)
 
-        # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
-
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
@@ -328,25 +314,27 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, cond=None):
         """
         x: (N, C, H, W)
         t: (N,)
-        y: (N,)
+        cond: (N, C_cond, H, W) or None
         """
-        # class and time embeddings
+        # time embeddings
         t_emb = self.t_embedder(t)
-        y_emb = self.y_embedder(y)
-        c = t_emb + y_emb
+        c = t_emb
+
+        if cond is not None:
+            x = torch.cat([x, cond], dim=1)
 
         # forward JiT
         x = self.x_embedder(x)
-        x += self.pos_embed
+        x += self.pos_embed 
 
         for i, block in enumerate(self.blocks):
             # in-context
             if self.in_context_len > 0 and i == self.in_context_start:
-                in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
+                in_context_tokens = t_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
                 in_context_tokens += self.in_context_posemb
                 x = torch.cat([in_context_tokens, x], dim=1)
             x = block(x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext)
@@ -361,7 +349,7 @@ class JiT(nn.Module):
 
 def JiT_B_16(**kwargs):
     return JiT(depth=12, hidden_size=768, num_heads=12,
-               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=16, **kwargs)
+               bottleneck_dim=128, in_context_len=0, in_context_start=4, patch_size=16, **kwargs)
 
 def JiT_B_32(**kwargs):
     return JiT(depth=12, hidden_size=768, num_heads=12,
