@@ -9,9 +9,7 @@ from util.transforms import ColorJitter, Compose, Normalize, RandomAffine, Rando
 
 
 def get_octa_transform(image_size):
-
     transform_train = Compose([
-        Resize((256, 256)),
         RandomCrop((image_size, image_size)),
         RandomHorizontalFlip(),
         RandomVerticalFlip(),
@@ -24,7 +22,7 @@ def get_octa_transform(image_size):
     ])
 
     transform_val = Compose([
-        Resize((image_size, image_size)),
+        RandomCrop((image_size, image_size)),
         ToTensor(),
     ])
 

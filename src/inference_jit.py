@@ -1,6 +1,8 @@
 import argparse
 import contextlib
+import datetime
 import os
+from functools import partial
 from pathlib import Path
 
 import autorootcwd
@@ -14,6 +16,8 @@ from tqdm import tqdm
 
 from denoiser import Denoiser
 from engine_jit import compute_dice_score, compute_hausdorff_distance_95, compute_iou_score, compute_sensitivity, compute_specificity, save_metrics_to_csv
+from util.isicdataset import ISICSegmentationDataset, SameSizeBatchSampler, get_isic_transform
+from util.monudataset import MoNuSegmentationDataset, get_monu_transform
 from util.octadataset import OCTASegmentationDataset, get_octa_transform
 
 
@@ -34,6 +38,7 @@ def get_args_parser():
     parser.add_argument("--cfg", default=1.0, type=float)
     parser.add_argument("--interval_min", default=0.0, type=float)
     parser.add_argument("--interval_max", default=1.0, type=float)
+    parser.add_argument("--soft_vote", action=argparse.BooleanOptionalAction)
 
     # noise params
     parser.add_argument("--P_mean", default=-0.8, type=float)
@@ -55,6 +60,7 @@ def get_args_parser():
     parser.add_argument("--num_workers", default=4, type=int)
     parser.add_argument("--device", default="cuda", type=str)
     parser.add_argument("--seed", default=0, type=int)
+    parser.add_argument("--same_size_batch", action="store_true")
 
     # patch sampling
     parser.add_argument("--samp_patch_size", default=256, type=int)
@@ -63,7 +69,6 @@ def get_args_parser():
     # inference options
     parser.add_argument("--ema", default="ema1", choices=["none", "ema1", "ema2"], type=str)
     parser.add_argument("--threshold", default=0.5, type=float)
-    parser.add_argument("--save_prob", action="store_true")
     parser.add_argument("--metrics", action="store_true", help="Compute metrics if labels exist")
 
     return parser
@@ -108,18 +113,33 @@ def _extract_patches(image: torch.Tensor, samp_patch_size: int, stride: int):
     return torch.stack(patches), positions
 
 
-def _reconstruct_from_patches(patches: torch.Tensor, positions: list, orig_shape: tuple, samp_patch_size: int):
-    """Reconstruct full image from overlapping patches using weighted averaging."""
+def _reconstruct_from_patches(
+    patches: torch.Tensor,
+    positions: list,
+    orig_shape: tuple,
+    samp_patch_size: int,
+    soft_vote: bool = False,
+    threshold: float = 0.5,
+):
+    """Reconstruct full image from overlapping patches using soft or hard voting."""
+    if len(orig_shape) == 2:
+        orig_shape = (1, orig_shape[0], orig_shape[1])
     c, h, w = orig_shape
-    output = torch.zeros((c, h, w), device=patches.device, dtype=patches.dtype)
-    weight = torch.zeros((h, w), device=patches.device, dtype=patches.dtype)
+    vote_sum = torch.zeros((c, h, w), device=patches.device, dtype=torch.float32)
+    vote_count = torch.zeros((h, w), device=patches.device, dtype=torch.float32)
 
+    # Hard voting: threshold patches at 0.5 first, then accumulate votes
     for patch, (top, left) in zip(patches, positions):
-        output[:, top:top + samp_patch_size, left:left + samp_patch_size] += patch
-        weight[top:top + samp_patch_size, left:left + samp_patch_size] += 1
+        if soft_vote:
+            _patch = patch
+        else:
+            _patch = (patch > threshold).float()
+        vote_sum[:, top:top + samp_patch_size, left:left + samp_patch_size] += _patch
+        vote_count[top:top + samp_patch_size, left:left + samp_patch_size] += 1
 
-    output = output / weight.clamp(min=1.0)
-    return output
+    # Calculate voting confidence (ratio of votes that were 1)
+    output = vote_sum / vote_count.clamp(min=1.0).unsqueeze(0)
+    return (output >= threshold).float(), output
 
 
 def _load_checkpoint(model: torch.nn.Module, checkpoint_path: str, ema: str):
@@ -139,42 +159,41 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint_path: str, ema: str):
         model.load_state_dict(checkpoint, strict=False)
 
 
-def _save_mask(output_dir: str, rel_path: str, pred: torch.Tensor, threshold: float, save_prob: bool, postfix: str = "_mask", epoch: int = None, is_binary: bool = True):
-    image_dir = Path(output_dir, f"images-{epoch}" if epoch is not None else "images")
-    # pred = ((pred + 1.0) / 2.0).to(torch.float32)  # Rescale to [0, 1]
-
+def _save_mask(output_dir: str, rel_name: str, data: torch.Tensor, threshold: float, postfix: str = "_mask", epoch: int = None, is_binary: bool = False):
     # Remove all singleton dimensions and get 2D array
-    while pred.ndim > 2:
-        pred = pred.squeeze(0)
+    while data.ndim > 2 and data.shape[0] == 1:
+        data = data.squeeze(0)
 
-    rel_stem = os.path.splitext(rel_path)[0]
-    out_path = os.path.join(image_dir, f"{rel_stem}{postfix}.npy")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    if save_prob:
-        prob = pred.cpu().numpy()
-        np.save(out_path.replace(f"{postfix}.npy", "_prob.npy"), prob)
+    rel_stem = os.path.splitext(rel_name)[0]
+    out_path = os.path.join(output_dir, f"{rel_stem}{postfix}.npy")
 
     if not is_binary:
-        data = pred.cpu().numpy()
+        data = data.cpu().numpy()
         np.save(out_path, data)
     else:
-        binary = (pred > threshold).cpu().numpy()
+        binary = (data > threshold).cpu().numpy()
         np.save(out_path, binary)
 
 
-def _save_intermediate_masks(output_dir: str, rel_path: str, intermediates: list, epoch: int = None):
-    image_dir = Path(output_dir, f"images-{epoch}" if epoch is not None else "images", "intermediates")
-
-    rel_stem = os.path.splitext(rel_path)[0]
-    os.makedirs(image_dir, exist_ok=True)
+def _save_intermediate_masks(output_dir: str, rel_name: str, intermediates: list, epoch: int = None):
+    rel_stem = os.path.splitext(rel_name)[0]
     for idx, intermediate in enumerate(intermediates):
-        while intermediate.ndim > 2:
+        while intermediate.ndim > 2 and intermediate.shape[0] == 1:
             intermediate = intermediate.squeeze(0)
-        intermediate = torch.clamp((intermediate + 1.0) / 2.0, 0.0, 1.0)
+        if intermediate.min() < 0.0 or intermediate.max() > 1.0:
+            intermediate = (intermediate + 1.0) / 2.0
         data = intermediate.cpu().numpy()
-        out_path = os.path.join(image_dir, f"{rel_stem}_{idx:03d}.npy")
+        out_path = os.path.join(output_dir, f"{rel_stem}_{idx:03d}.npy")
         np.save(out_path, data)
+
+
+def _log(message: str, log_path: Path | None = None):
+    print(message, flush=True)
+    if log_path is None:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{message}\n")
 
 
 def main(args):
@@ -183,27 +202,77 @@ def main(args):
 
     device = torch.device(args.device)
 
-    _, _, transform_test = get_octa_transform(args.img_size)
-    dataset = OCTASegmentationDataset(
-        args.data_path,
-        img_size=args.img_size,
-        transform=transform_test,
-    )
-    data_loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        shuffle=False,
-    )
-
     output_dir = os.path.join(args.output_dir, f"{args.model.replace('/', '-')}-{args.dataset}")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = Path(args.output_dir, "logs")
+    log_path = log_dir / f"training_{timestamp}.log"
 
+    _log("[1/4] Build dataset and dataloader", log_path)
+
+    if 'OCTA' in args.dataset:
+        _, _, transform_test = get_octa_transform(args.img_size)
+        dataset = OCTASegmentationDataset(
+            args.data_path,
+            img_size=args.img_size,
+            transform=transform_test,
+        )
+        data_loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+            shuffle=False,
+        )
+    elif 'MoNuSeg' in args.dataset:
+        _,  transform_test = get_monu_transform(image_size=args.img_size)
+        dataset = MoNuSegmentationDataset(
+            args.data_path,
+            img_size=args.img_size,
+            transform=transform_test,
+        )
+        data_loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+            shuffle=False,
+        )
+    elif 'ISIC' in args.dataset:
+        _, _, transform_test = get_isic_transform(args.img_size)
+        dataset = ISICSegmentationDataset(
+            args.data_path,
+            img_size=args.img_size,
+            transform=transform_test,
+        )
+        use_same_size = args.same_size_batch or "test" in args.data_path
+        if use_same_size:
+            batch_sampler = SameSizeBatchSampler(
+                dataset.get_image_sizes(),
+                batch_size=args.batch_size,
+                shuffle=False,
+                drop_last=False,
+            )
+            data_loader = DataLoader(
+                dataset,
+                batch_sampler=batch_sampler,
+                num_workers=args.num_workers,
+                pin_memory=(device.type == "cuda"),
+            )
+        else:
+            data_loader = DataLoader(
+                dataset,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                pin_memory=(device.type == "cuda"),
+                shuffle=False,
+            )
+
+    _log(f"[2/4] Initialize model and load checkpoint from {Path(output_dir, 'checkpoints', args.checkpoint)}", log_path)
     model = Denoiser(args)
     _load_checkpoint(model, Path(output_dir, 'checkpoints', args.checkpoint), args.ema)
     epoch = args.checkpoint.replace('checkpoint-', '').replace('.pth', '')
-    print(f"Loaded checkpoint '{args.checkpoint}' for epoch {epoch}")
+    _log(f"Loaded checkpoint '{args.checkpoint}' for epoch {epoch}", log_path)
     model.to(device)
     model.eval()
 
@@ -220,15 +289,19 @@ def main(args):
     hd95_scores = []
     sample_idx = 0
 
+    image_dir = Path(output_dir, f"images-{epoch}{'-softvote' if args.soft_vote else ''}" if epoch is not None else "images")
+    _log(f"Saving results to {image_dir}", log_path)
+    intermediates_dir = image_dir / "intermediates"
+    os.makedirs(image_dir, exist_ok=True)
+    os.makedirs(intermediates_dir, exist_ok=True)
+
+    _log("[3/4] Run inference", log_path)
     with torch.no_grad():
         for images, gts in tqdm(data_loader, desc="Processing images"):
-            batch_preds = []
-            batch_gts = []
-
             for idx in range(images.size(0)):
                 image = images[idx]
                 gt = gts[idx]
-                orig_shape = image.shape
+                orig_shape = gt.shape
 
                 # Extract patches
                 patches, positions = _extract_patches(image, args.samp_patch_size, args.stride)
@@ -247,38 +320,41 @@ def main(args):
                 all_patch_preds = torch.cat(all_patch_preds, dim=0)
 
                 # Reconstruct full mask
-                full_pred = _reconstruct_from_patches(
-                    all_patch_preds.squeeze(1), positions, orig_shape, args.samp_patch_size
+                full_pred_binary, full_pred = _reconstruct_from_patches(
+                    all_patch_preds.squeeze(1),
+                    positions,
+                    orig_shape,
+                    args.samp_patch_size,
+                    args.soft_vote,
+                    args.threshold,
                 )
-
-                batch_preds.append(full_pred)
-                batch_gts.append(gt)
 
                 # Save individual mask
                 rel_name = f"sample_{sample_idx:03d}"
-                _save_mask(output_dir, rel_name, full_pred, args.threshold, True, postfix="_pred", epoch=epoch)
-                _save_mask(output_dir, rel_name, image, args.threshold, args.save_prob, postfix="_image", epoch=epoch, is_binary=False)
-                _save_mask(output_dir, rel_name, gt, args.threshold, args.save_prob, postfix="_gt", epoch=epoch)
+                save_mask = partial(_save_mask, output_dir=image_dir, rel_name=rel_name, threshold=args.threshold, epoch=epoch)
+                save_mask(data=full_pred, postfix="_prob")
+                save_mask(data=full_pred_binary,  postfix="_pred", is_binary=True)
+                save_mask(data=image, postfix="_image")
+                save_mask(data=gt, postfix="_gt", is_binary=True)
                 # Save intermediate masks for the few samples
                 if sample_idx % 20 == 0:
-                    _save_intermediate_masks(output_dir, f"sample_{sample_idx:03d}_intermediate", intermediates, epoch=epoch)
-                    _save_intermediate_masks(output_dir, f"sample_{sample_idx:03d}_patch", patches, epoch=epoch)
+                    _save_intermediate_masks(intermediates_dir, f"sample_{sample_idx:03d}_intermediate", intermediates, epoch=epoch)
+                    _save_intermediate_masks(intermediates_dir, f"sample_{sample_idx:03d}_patch", patches, epoch=epoch)
+                if args.metrics:
+                    pred_single = full_pred_binary.to(device).unsqueeze(0)
+                    gt_single = gt.to(device).unsqueeze(0)
+                    dice_scores.append(compute_dice_score(pred_single, gt_single, threshold=args.threshold))
+                    iou_scores.append(compute_iou_score(pred_single, gt_single, threshold=args.threshold))
+                    sensitivity_scores.append(compute_sensitivity(pred_single, gt_single, threshold=args.threshold))
+                    specificity_scores.append(compute_specificity(pred_single, gt_single, threshold=args.threshold))
+                    hd95_scores.append(compute_hausdorff_distance_95(pred_single, gt_single, threshold=args.threshold))
+
                 sample_idx += 1
 
-            if args.metrics:
-                # Stack for batch metrics
-                pred_batch = torch.stack(batch_preds).to(device)
-                gts_batch = torch.stack(batch_gts).to(device)
-
-                dice_scores.append(compute_dice_score(pred_batch, gts_batch, threshold=args.threshold))
-                iou_scores.append(compute_iou_score(pred_batch, gts_batch, threshold=args.threshold))
-                sensitivity_scores.append(compute_sensitivity(pred_batch, gts_batch, threshold=args.threshold))
-                specificity_scores.append(compute_specificity(pred_batch, gts_batch, threshold=args.threshold))
-                hd95_scores.append(compute_hausdorff_distance_95(pred_batch, gts_batch, threshold=args.threshold))
-
     if args.metrics and dice_scores:
+        _log("[4/4] Save metrics", log_path)
         save_metrics_to_csv(output_dir, epoch, dice_scores, iou_scores,
-                            sensitivity_scores, specificity_scores, hd95_scores)
+                            sensitivity_scores, specificity_scores, hd95_scores, args.soft_vote)
 
 
 if __name__ == "__main__":

@@ -9,25 +9,22 @@ from util.transforms import ColorJitter, Compose, Normalize, RandomAffine, Rando
 
 
 def get_monu_transform(image_size):
-
     transform_train = Compose([
-        Resize((512, 512)),
         RandomCrop((image_size, image_size)),
         RandomHorizontalFlip(),
         RandomVerticalFlip(),
-        RandomAffine(int(22), scale=(float(0.75), float(1.25))),
+        # RandomAffine(int(22), scale=(float(0.75), float(1.25))),
         ColorJitter(brightness=0.4,
                     contrast=0.4,
                     saturation=0.4,
                     hue=0.1),
         ToTensor(),
-        Normalize(mean=[142.07, 98.48, 132.96], std=[65.78, 57.05, 57.78])
     ])
+
     transform_test = Compose([
-        Resize((512, 512)),
         ToTensor(),
-        Normalize(mean=[142.07, 98.48, 132.96], std=[65.78, 57.05, 57.78])
     ])
+
     return transform_train, transform_test
 
 
@@ -37,12 +34,12 @@ class MoNuSegmentationDataset(Dataset):
     Assumes directory structure:
     root/
     ├── images/
-    │   ├── image1.bmp
-    │   ├── image2.bmp
+    │   ├── image1.tif
+    │   ├── image2.tif
     │   └── ...
     └── labels/
-        ├── image1.bmp
-        ├── image2.bmp
+        ├── image1.npy
+        ├── image2.npy
         └── ...
     """
 
@@ -59,8 +56,8 @@ class MoNuSegmentationDataset(Dataset):
             root_dir (str): Root directory containing 'images' and 'labels' subdirectories
             transform (callable, optional): Transforms to apply to images
             target_transform (callable, optional): Transforms to apply to labels
-            image_ext (str): File extension for images (e.g., '.bmp')
-            label_ext (str): File extension for labels (e.g., '.bmp')
+            image_ext (str): File extension for images (e.g., '.tif')
+            label_ext (str): File extension for labels (e.g., '.npy')
             transform (callable, optional): Synchronized transforms for image and label
         """
         self.root_dir = root_dir

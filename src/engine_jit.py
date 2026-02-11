@@ -243,7 +243,7 @@ def evaluate(model_without_ddp, data_loader, device, epoch, log_writer=None, thr
     model_without_ddp.train()
 
 
-def save_metrics_to_csv(output_dir, epoch, dice_scores, iou_scores, sensitivity_scores, specificity_scores, hd95_scores):
+def save_metrics_to_csv(output_dir, epoch, dice_scores, iou_scores, sensitivity_scores, specificity_scores, hd95_scores, soft_vote):
     """
     Save individual and average metrics to CSV files.
 
@@ -264,7 +264,7 @@ def save_metrics_to_csv(output_dir, epoch, dice_scores, iou_scores, sensitivity_
     avg_hd95 = np.mean(hd95_scores)
 
     # Save individual results to CSV
-    results_csv_path = os.path.join(output_dir, f"results-{epoch}.csv")
+    results_csv_path = os.path.join(output_dir, f"results-{epoch}{'-soft_vote' if soft_vote else ''}.csv")
     with open(results_csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['Sample', 'Dice', 'IoU', 'Sensitivity', 'Specificity', 'HD95'])
@@ -280,7 +280,7 @@ def save_metrics_to_csv(output_dir, epoch, dice_scores, iou_scores, sensitivity_
     print(f"Individual results saved to {results_csv_path}")
 
     # Save average results to CSV
-    avg_csv_path = os.path.join(output_dir, f"average_results-{epoch}.csv")
+    avg_csv_path = os.path.join(output_dir, f"average_results-{epoch}{'-soft_vote' if soft_vote else ''}.csv")
     with open(avg_csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['Metric', 'Value'])

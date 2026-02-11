@@ -1,6 +1,7 @@
 import argparse
 import copy
 import datetime
+import logging
 import os
 import random
 import time
@@ -20,6 +21,8 @@ import util.misc as misc
 from denoiser import Denoiser
 from engine_jit import evaluate, train_one_epoch
 from util.crop import center_crop_arr
+from util.isicdataset import ISICSegmentationDataset, get_isic_transform
+from util.monudataset import MoNuSegmentationDataset, get_monu_transform
 from util.octadataset import OCTASegmentationDataset, get_octa_transform
 
 
@@ -98,7 +101,7 @@ def get_args_parser():
                         help='Directory to save outputs (empty for no saving)')
     parser.add_argument('--resume', default='',
                         help='Folder that contains checkpoint to resume from')
-    parser.add_argument('--save_last_freq', type=int, default=5,
+    parser.add_argument('--save_last_freq', type=int, default=10,
                         help='Frequency (in epochs) to save checkpoints')
     parser.add_argument('--log_freq', default=50, type=int)
     parser.add_argument('--device', default='cuda',
@@ -117,8 +120,6 @@ def get_args_parser():
 
 def main(args):
     misc.init_distributed_mode(args)
-    print('Job directory:', os.path.dirname(os.path.realpath(__file__)))
-    print("Arguments:\n{}".format(args).replace(', ', ',\n'))
 
     device = torch.device(args.device)
 
@@ -132,7 +133,7 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
-    # Set up TensorBoard logging (only on main process)
+    # Set up output directory and logging (only on main process)
     args.output_dir = os.path.join(args.output_dir, f"{args.model.replace('/', '-')}-{args.dataset}")
     checkpoint_dir = os.path.join(args.output_dir, 'checkpoints')
     tensorboard_dir = os.path.join(args.output_dir, 'tensorboard')
@@ -144,8 +145,24 @@ def main(args):
     else:
         log_writer = None
 
+    logger = logging.getLogger("jit_train")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if misc.is_main_process() and not logger.handlers:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = os.path.join(args.output_dir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"training_{timestamp}.log")
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        logger.addHandler(file_handler)
+    elif not logger.handlers:
+        logger.addHandler(logging.NullHandler())
+
+    logger.info('Job directory: %s', os.path.dirname(os.path.realpath(__file__)))
+    logger.info("Arguments:\n%s", str(args).replace(', ', ',\n'))
+
     # Data augmentation transforms
-    transform_train, transform_val, _ = get_octa_transform(image_size=args.img_size)
 
     # Load dataset - support both ImageFolder and OCTA segmentation formats
     train_path = os.path.join(args.data_path, 'train')
@@ -153,6 +170,7 @@ def main(args):
 
     if 'OCTA' in args.dataset:
         # OCTA segmentation dataset format
+        transform_train, transform_val, _ = get_octa_transform(image_size=args.img_size)
         dataset_train = OCTASegmentationDataset(
             train_path,
             img_size=args.img_size,
@@ -163,24 +181,38 @@ def main(args):
             img_size=args.img_size,
             transform=transform_val,
         )
-        print(f"Loaded OCTA training dataset with {len(dataset_train)} images")
-        print(f"Loaded OCTA validation dataset with {len(dataset_val)} images")
+    elif 'MoNuSeg' == args.dataset:
+        transform_train,  _ = get_monu_transform(image_size=args.img_size)
+        dataset_train = MoNuSegmentationDataset(
+            train_path,
+            img_size=args.img_size,
+            transform=transform_train,
+        )
+    elif 'ISIC2016' == args.dataset:
+        transform_train, _,  _ = get_isic_transform(image_size=args.img_size)
+        dataset_train = ISICSegmentationDataset(
+            train_path,
+            img_size=args.img_size,
+            transform=transform_train,
+        )
+    elif 'ISIC2018' == args.dataset:
+        transform_train, transform_val,  _ = get_isic_transform(image_size=args.img_size)
+        dataset_train = ISICSegmentationDataset(
+            train_path,
+            img_size=args.img_size,
+            transform=transform_train,
+        )
+        dataset_val = ISICSegmentationDataset(
+            val_path,
+            img_size=args.img_size,
+            transform=transform_val,
+        )
     else:
-        # ImageFolder format
-        dataset_train = datasets.ImageFolder(train_path, transform=transform_train)
-        dataset_val = datasets.ImageFolder(val_path, transform=transform_val)
-        print(dataset_train)
-        print(dataset_val)
+        raise NotImplementedError(f"Dataset {args.dataset} not supported.")
 
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
     )
-    sampler_val = torch.utils.data.DistributedSampler(
-        dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
-    )
-    print("Sampler_train =", sampler_train)
-    print("Sampler_val =", sampler_val)
-
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size,
@@ -188,14 +220,21 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True
     )
+    logger.info("Sampler_train = %s", sampler_train)
 
-    data_loader_val = torch.utils.data.DataLoader(
-        dataset_val, sampler=sampler_val,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=False
-    )
+    if args.online_eval:
+        sampler_val = torch.utils.data.DistributedSampler(
+            dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False
+        )
+        logger.info("Sampler_val = %s", sampler_val)
+
+        data_loader_val = torch.utils.data.DataLoader(
+            dataset_val, sampler=sampler_val,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=False
+        )
 
     torch._dynamo.config.cache_size_limit = 128
     torch._dynamo.config.optimize_ddp = False
@@ -203,9 +242,9 @@ def main(args):
     # Create denoiser
     model = Denoiser(args)
 
-    print("Model =", model)
+    logger.info("Model = %s", model)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("Number of trainable parameters: {:.6f}M".format(n_params / 1e6))
+    logger.info("Number of trainable parameters: %.6fM", n_params / 1e6)
 
     model.to(device)
 
@@ -213,17 +252,20 @@ def main(args):
     if args.lr is None:  # only base_lr (blr) is specified
         args.lr = args.blr * eff_batch_size / 256
 
-    print("Base lr: {:.2e}".format(args.lr * 256 / eff_batch_size))
-    print("Actual lr: {:.2e}".format(args.lr))
-    print("Effective batch size: %d" % eff_batch_size)
+    logger.info("Base lr: %.2e", args.lr * 256 / eff_batch_size)
+    logger.info("Actual lr: %.2e", args.lr)
+    logger.info("Effective batch size: %d", eff_batch_size)
 
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-    model_without_ddp = model.module
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model_without_ddp = model.module
+    else:
+        model_without_ddp = model
 
     # Set up optimizer with weight decay adjustment for bias and norm layers
     param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
-    print(optimizer)
+    logger.info("%s", optimizer)
 
     # Resume from checkpoint if provided
     checkpoint_path = os.path.join(checkpoint_dir, "checkpoint-last.pth")
@@ -242,20 +284,20 @@ def main(args):
         ema_state_dict2 = checkpoint['model_ema2']
         model_without_ddp.ema_params1 = [ema_state_dict1[name].cuda() for name, _ in model_without_ddp.named_parameters()]
         model_without_ddp.ema_params2 = [ema_state_dict2[name].cuda() for name, _ in model_without_ddp.named_parameters()]
-        print("Resumed checkpoint from", checkpoint_path)
+        logger.info("Resumed checkpoint from %s", checkpoint_path)
 
         if 'optimizer' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             args.start_epoch = checkpoint['epoch'] + 1
-            print("Loaded optimizer & scaler state!")
+            logger.info("Loaded optimizer & scaler state!")
         del checkpoint
     else:
         model_without_ddp.ema_params1 = copy.deepcopy(list(model_without_ddp.parameters()))
         model_without_ddp.ema_params2 = copy.deepcopy(list(model_without_ddp.parameters()))
-        print("Training from scratch")
+        logger.info("Training from scratch")
 
     # Training loop
-    print(f"Start training for {args.epochs} epochs")
+    logger.info("Start training for %d epochs", args.epochs)
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -264,16 +306,20 @@ def main(args):
         train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
 
         # Save checkpoint periodically
-        if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
+        if epoch % args.save_last_freq == 0:
+            if epoch + 1 == args.epochs:
+                epoch_name = args.epochs
+            else:
+                epoch_name = "last"
             misc.save_model(
                 args=args,
                 model_without_ddp=model_without_ddp,
                 optimizer=optimizer,
                 epoch=epoch,
-                epoch_name="last"
+                epoch_name=epoch_name
             )
 
-        if epoch % 500 == 0 and epoch > 0:
+        if epoch % 1000 == 0 and epoch > 0:
             misc.save_model(
                 args=args,
                 model_without_ddp=model_without_ddp,
@@ -290,10 +336,17 @@ def main(args):
 
         if misc.is_main_process() and log_writer is not None:
             log_writer.flush()
+    misc.save_model(
+        args=args,
+        model_without_ddp=model_without_ddp,
+        optimizer=optimizer,
+        epoch=epoch,
+        epoch_name=epoch+1
+    )
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time:', total_time_str)
+    logger.info("Training time: %s", total_time_str)
 
 
 if __name__ == '__main__':
