@@ -275,7 +275,10 @@ def save_model(args, model_without_ddp, optimizer, epoch, epoch_name=None):
     to_save['model_ema1'] = ema_state_dict1
     to_save['model_ema2'] = ema_state_dict2
 
-    save_on_master(to_save, checkpoint_path)
+    tmp_checkpoint_path = output_dir / 'checkpoints' / ('checkpoint-%s.pth.tmp' % epoch_name)
+    save_on_master(to_save, tmp_checkpoint_path)
+    if is_main_process():
+        os.replace(tmp_checkpoint_path, checkpoint_path)
 
 
 def all_reduce_mean(x):

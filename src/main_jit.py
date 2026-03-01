@@ -1,4 +1,5 @@
 import argparse
+import ast
 import copy
 import datetime
 import logging
@@ -17,9 +18,10 @@ from natsort import natsorted
 from PIL import Image
 from torch.utils.tensorboard import SummaryWriter
 
+import losses.losses as custom_losses
 import util.misc as misc
 from denoiser import Denoiser
-from engine_jit import evaluate, train_one_epoch
+from engine_jit import train_one_epoch, validation
 from util.crop import center_crop_arr
 from util.isicdataset import ISICSegmentationDataset, get_isic_transform
 from util.monudataset import MoNuSegmentationDataset, get_monu_transform
@@ -33,10 +35,19 @@ def get_args_parser():
     parser.add_argument('--model', default='JiT-B/16', type=str, metavar='MODEL',
                         help='Name of the model to train')
     parser.add_argument('--img_size', default=256, type=int, help='Image size')
-    parser.add_argument('--attn_dropout', type=float, default=0.0, help='Attention dropout rate')
-    parser.add_argument('--proj_dropout', type=float, default=0.0, help='Projection dropout rate')
-    parser.add_argument('--img_channel', type=int, default=3, help='Number of image channels')
-    parser.add_argument('--mask_channel', type=int, default=1, help='Number of mask channels')
+    parser.add_argument('--attn_dropout', type=float, default=0.0,
+                        help='Attention dropout rate')
+    parser.add_argument('--proj_dropout', type=float, default=0.0,
+                        help='Projection dropout rate')
+    parser.add_argument('--img_channel', type=int, default=3,
+                        help='Number of image channels')
+    parser.add_argument('--mask_channel', type=int, default=1,
+                        help='Number of mask channels')
+    # "{'cond': 'fixed', 'low_cond': 'fixed', 'high_cond': 'fixed'}"
+    # fixed(1.0), shared(all blocks share the same weight),
+    # learnable(all blocks have their own weight initialized to 1), zero_init(all blocks have their own weight initialized to 0)
+    parser.add_argument('--cond_weight', type=str, default=None,
+                        help='Weight configs for cond, low_cond, high_cond')
 
     # training
     parser.add_argument('--epochs', default=200, type=int)
@@ -63,6 +74,9 @@ def get_args_parser():
     parser.add_argument('--noise_scale', default=1.0, type=float)
     parser.add_argument('--t_eps', default=5e-2, type=float)
     parser.add_argument('--label_drop_prob', default=0.1, type=float)
+    parser.add_argument('--add_loss', action='store_true', default=False)
+    parser.add_argument('--add_loss_name', type=str, default='dice_bce')
+    parser.add_argument('--add_loss_weight', type=float, default=1.0)
 
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -119,6 +133,12 @@ def get_args_parser():
 
 
 def main(args):
+    if isinstance(args.cond_weight, str):
+        try:
+            args.cond_weight = ast.literal_eval(args.cond_weight)
+        except Exception:
+            pass
+
     misc.init_distributed_mode(args)
 
     device = torch.device(args.device)
@@ -133,8 +153,18 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
+    cond_weight_str = ""
+    if hasattr(args, 'cond_weight') and args.cond_weight is not None:
+        try:
+            c = args.cond_weight.get('cond', 'fixed')[0]
+            l = args.cond_weight.get('low_cond', 'fixed')[0]
+            h = args.cond_weight.get('high_cond', 'fixed')[0]
+            cond_weight_str = f"-{c}{l}{h}"
+        except Exception:
+            pass
+
     # Set up output directory and logging (only on main process)
-    args.output_dir = os.path.join(args.output_dir, f"{args.model.replace('/', '-')}-{args.dataset}")
+    args.output_dir = os.path.join(args.output_dir, f"{args.model.replace('/', '-')}{cond_weight_str}-{args.dataset}{f'-{args.add_loss_name}' if args.add_loss else ''}")
     checkpoint_dir = os.path.join(args.output_dir, 'checkpoints')
     tensorboard_dir = os.path.join(args.output_dir, 'tensorboard')
     if misc.is_main_process():
@@ -257,7 +287,8 @@ def main(args):
     logger.info("Effective batch size: %d", eff_batch_size)
 
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.gpu])
         model_without_ddp = model.module
     else:
         model_without_ddp = model
@@ -268,23 +299,48 @@ def main(args):
     logger.info("%s", optimizer)
 
     # Resume from checkpoint if provided
-    checkpoint_path = os.path.join(checkpoint_dir, "checkpoint-last.pth")
+    checkpoint = None
+    ckpt_to_load = None
 
-    # If checkpoint-last.pth doesn't exist, find the latest .pth file
-    if not os.path.exists(checkpoint_path) and os.path.isdir(checkpoint_dir):
-        pth_files = natsorted([f for f in os.listdir(checkpoint_dir) if f.endswith('.pth')])
-        if pth_files:
-            checkpoint_path = os.path.join(checkpoint_dir, pth_files[-1])
+    if args.resume == "scratch":
+        logger.info("Training from scratch explicitly requested.")
+    else:
+        # Load specified resume file or fallback to last checkpoint
+        ckpt_to_load = os.path.join(checkpoint_dir, args.resume) if args.resume else os.path.join(checkpoint_dir, "checkpoint-last.pth")
 
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-        model_without_ddp.load_state_dict(checkpoint['model'])
+        if os.path.exists(ckpt_to_load):
+            try:
+                checkpoint = torch.load(ckpt_to_load, map_location='cpu', weights_only=False)
+                logger.info("Successfully loaded checkpoint from %s", ckpt_to_load)
+            except Exception as exc:
+                logger.warning("Failed to load checkpoint from %s: %s", ckpt_to_load, exc)
+
+        if checkpoint is None and not args.resume:
+            logger.info("Auto-resume enabled but checkpoint-last.pth is unavailable or corrupted. Searching for available checkpoints...")
+            import glob
+            from natsort import natsorted
+            all_ckpts = natsorted(glob.glob(os.path.join(checkpoint_dir, 'checkpoint-*.pth')))
+            all_ckpts = [c for c in all_ckpts if 'last' not in c]
+            for c in reversed(all_ckpts):
+                try:
+                    checkpoint = torch.load(c, map_location='cpu', weights_only=False)
+                    logger.info("Successfully loaded fallback checkpoint from %s", c)
+                    ckpt_to_load = c
+                    break
+                except Exception as e:
+                    logger.warning("Failed to load fallback checkpoint from %s: %s", c, e)
+
+        elif checkpoint is None and args.resume:
+            logger.warning("Specified resume checkpoint '%s' not found or could not be loaded.", ckpt_to_load)
+
+    if checkpoint is not None:
+        model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
 
         ema_state_dict1 = checkpoint['model_ema1']
         ema_state_dict2 = checkpoint['model_ema2']
         model_without_ddp.ema_params1 = [ema_state_dict1[name].cuda() for name, _ in model_without_ddp.named_parameters()]
         model_without_ddp.ema_params2 = [ema_state_dict2[name].cuda() for name, _ in model_without_ddp.named_parameters()]
-        logger.info("Resumed checkpoint from %s", checkpoint_path)
+        logger.info("Resumed checkpoint from %s", ckpt_to_load)
 
         if 'optimizer' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -294,7 +350,25 @@ def main(args):
     else:
         model_without_ddp.ema_params1 = copy.deepcopy(list(model_without_ddp.parameters()))
         model_without_ddp.ema_params2 = copy.deepcopy(list(model_without_ddp.parameters()))
-        logger.info("Training from scratch")
+        logger.info("Training from scratch (no checkpoint loaded)")
+
+    # Define additional loss if args.add_loss is specified
+    additional_loss_fn = None
+    if args.add_loss:
+        if args.add_loss_name == 'bce':
+            additional_loss_fn = torch.nn.BCEWithLogitsLoss()
+        elif args.add_loss_name == 'dice':
+            additional_loss_fn = custom_losses.DiceLoss()
+        elif args.add_loss_name == 'soft_dice':
+            additional_loss_fn = custom_losses.SoftDiceLoss()
+        elif args.add_loss_name == 'dice_bce':
+            additional_loss_fn = custom_losses.BCEDiceLoss()
+        elif args.add_loss_name == 'weighted_dice_bce':
+            # Example weight, can be parameterized further if needed
+            additional_loss_fn = custom_losses.WeightedBCEDiceLoss(w_bce=1.0, w_dice=2.0)
+        else:
+            raise ValueError(
+                f"Unknown additional loss function: {args.add_loss_name}")
 
     # Training loop
     logger.info("Start training for %d epochs", args.epochs)
@@ -303,7 +377,7 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
+        train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args, additional_loss_fn=additional_loss_fn)
 
         # Save checkpoint periodically
         if epoch % args.save_last_freq == 0:
@@ -328,10 +402,11 @@ def main(args):
             )
 
         # Perform validation at specified intervals
-        if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
+        if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs) and epoch != 0:
             torch.cuda.empty_cache()
             with torch.no_grad():
-                evaluate(model_without_ddp, data_loader_val, device, epoch, log_writer=log_writer, threshold=args.threshold)
+                validation(model_without_ddp, data_loader_val, device, epoch, log_writer=log_writer, threshold=args.threshold,
+                           dataset=args.dataset, add_loss=args.add_loss, additional_loss_fn=additional_loss_fn)
             torch.cuda.empty_cache()
 
         if misc.is_main_process() and log_writer is not None:
@@ -340,8 +415,8 @@ def main(args):
         args=args,
         model_without_ddp=model_without_ddp,
         optimizer=optimizer,
-        epoch=epoch,
-        epoch_name=epoch+1
+        epoch=args.epochs,
+        epoch_name=args.epochs
     )
 
     total_time = time.time() - start_time

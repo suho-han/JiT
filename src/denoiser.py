@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from model_jit import JiT_models
+from src.models import JiT_models
 
 
 class Denoiser(nn.Module):
@@ -17,6 +17,7 @@ class Denoiser(nn.Module):
             out_channels=args.mask_channel,
             attn_drop=args.attn_dropout,
             proj_drop=args.proj_dropout,
+            cond_weight=args.cond_weight,
         )
         self.img_size = args.img_size
 

@@ -86,6 +86,7 @@ class OCTASegmentationDataset(Dataset):
 
         if img_size is None and transform is None:
             raise ValueError("Either img_size or transform must be provided")
+        self.img_size = img_size
 
     def __len__(self):
         return len(self.image_files)
@@ -107,6 +108,8 @@ class OCTASegmentationDataset(Dataset):
             raise FileNotFoundError(f"Label not found for image {image_fn}")
 
         # Apply joint transform (e.g., same crop/flip for image & mask)
+        if image.size[0] < self.img_size or image.size[1] < self.img_size:
+            image, label = Resize((self.img_size, self.img_size))(image, label)
         if self.transform:
             image, label = self.transform(image, label)
         return image, label

@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model_jit_condimg import JiT_CondImg
 from util.model_util import RMSNorm, VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed
 
 
@@ -85,9 +84,9 @@ class TimestepEmbedder(nn.Module):
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
     L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1))
-    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype).cuda()
+    attn_bias = query.new_zeros(query.size(0), 1, L, S)
 
-    with torch.cuda.amp.autocast(enabled=False):
+    with torch.amp.autocast(device_type=query.device.type, enabled=False):
         attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
     attn_weight += attn_bias
     attn_weight = torch.softmax(attn_weight, dim=-1)
@@ -122,6 +121,42 @@ class Attention(nn.Module):
 
         x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
 
+        x = x.transpose(1, 2).reshape(B, N, C)
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+
+        self.q_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
+
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, cond, rope=None):
+        B, N, C = x.shape
+        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        kv = self.kv(cond).reshape(B, cond.shape[1], 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        if rope is not None:
+            q = rope(q)
+            k = rope(k)
+
+        x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
         x = x.transpose(1, 2).reshape(B, N, C)
 
         x = self.proj(x)
@@ -179,22 +214,32 @@ class JiTBlock(nn.Module):
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
                               attn_drop=attn_drop, proj_drop=proj_drop)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
+        self.cross_attn = CrossAttention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
+                                         attn_drop=attn_drop, proj_drop=proj_drop)
+        self.norm3 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            nn.Linear(hidden_size, 9 * hidden_size, bias=True)
         )
 
     @torch.compile
-    def forward(self, x,  c, feat_rope=None):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
+    def forward(self, x, c, cond, feat_rope=None):
+        shift_msa, scale_msa, gate_msa, shift_xattn, scale_xattn, gate_xattn, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(9, dim=-1)
+        )
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        x = x + gate_xattn.unsqueeze(1) * self.cross_attn(
+            modulate(self.norm2(x), shift_xattn, scale_xattn),
+            cond,
+            rope=feat_rope,
+        )
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm3(x), shift_mlp, scale_mlp))
         return x
 
 
-class JiT(nn.Module):
+class JiT_CondImg(nn.Module):
     """
     Just image Transformer.
     """
@@ -214,7 +259,8 @@ class JiT(nn.Module):
         proj_drop=0.0,
         bottleneck_dim=128,
         in_context_len=32,
-        in_context_start=8
+        in_context_start=8,
+        cond_weight=None,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -231,8 +277,8 @@ class JiT(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_size)
 
         # linear embed
-        embed_in_channels = in_channels + cond_channels
-        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, embed_in_channels, bottleneck_dim, hidden_size, bias=True)
+        self.x_embedder = BottleneckPatchEmbed(input_size, patch_size, in_channels, bottleneck_dim, hidden_size, bias=True)
+        self.cond_embedder = BottleneckPatchEmbed(input_size, patch_size, cond_channels, bottleneck_dim, hidden_size, bias=True)
 
         # use fixed sin-cos embedding
         num_patches = self.x_embedder.num_patches
@@ -329,93 +375,19 @@ class JiT(nn.Module):
         t_emb = self.t_embedder(t)
         c = t_emb
 
-        if cond is not None:
-            x = torch.cat([x, cond], dim=1)
+        if cond is None and self.cond_channels > 0:
+            cond = x.new_zeros((x.size(0), self.cond_channels, x.size(2), x.size(3)))
 
         # forward JiT
         x = self.x_embedder(x)
         x += self.pos_embed
+        cond = self.cond_embedder(cond)
+        cond += self.pos_embed
 
         for i, block in enumerate(self.blocks):
-            x = block(x, c, self.feat_rope)
+            x = block(x, c, cond, self.feat_rope)
 
         x = self.final_layer(x, c)
         output = self.unpatchify(x, self.patch_size)
 
         return output
-
-
-def JiT_B_16(**kwargs):
-    return JiT(depth=12, hidden_size=768, num_heads=12,
-               bottleneck_dim=128, in_context_len=0, patch_size=16, **kwargs)
-
-
-def JiT_B_32(**kwargs):
-    return JiT(depth=12, hidden_size=768, num_heads=12,
-               bottleneck_dim=128, in_context_len=0, patch_size=32, **kwargs)
-
-
-def JiT_L_16(**kwargs):
-    return JiT(depth=24, hidden_size=1024, num_heads=16,
-               bottleneck_dim=128, in_context_len=0, patch_size=16, **kwargs)
-
-
-def JiT_L_32(**kwargs):
-    return JiT(depth=24, hidden_size=1024, num_heads=16,
-               bottleneck_dim=128, in_context_len=0, patch_size=32, **kwargs)
-
-
-def JiT_H_16(**kwargs):
-    return JiT(depth=32, hidden_size=1280, num_heads=16,
-               bottleneck_dim=256, in_context_len=0, patch_size=16, **kwargs)
-
-
-def JiT_H_32(**kwargs):
-    return JiT(depth=32, hidden_size=1280, num_heads=16,
-               bottleneck_dim=256, in_context_len=0, patch_size=32, **kwargs)
-
-
-def JiT_CondImg_B_16(**kwargs):
-    return JiT_CondImg(depth=12, hidden_size=768, num_heads=12,
-                       bottleneck_dim=128, in_context_len=0, in_context_start=4, patch_size=16, **kwargs)
-
-
-def JiT_CondImg_B_32(**kwargs):
-    return JiT_CondImg(depth=12, hidden_size=768, num_heads=12,
-                       bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=32, **kwargs)
-
-
-def JiT_CondImg_L_16(**kwargs):
-    return JiT_CondImg(depth=24, hidden_size=1024, num_heads=16,
-                       bottleneck_dim=128, in_context_len=32, in_context_start=8, patch_size=16, **kwargs)
-
-
-def JiT_CondImg_L_32(**kwargs):
-    return JiT_CondImg(depth=24, hidden_size=1024, num_heads=16,
-                       bottleneck_dim=128, in_context_len=32, in_context_start=8, patch_size=32, **kwargs)
-
-
-def JiT_CondImg_H_16(**kwargs):
-    return JiT_CondImg(depth=32, hidden_size=1280, num_heads=16,
-                       bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=16, **kwargs)
-
-
-def JiT_CondImg_H_32(**kwargs):
-    return JiT_CondImg(depth=32, hidden_size=1280, num_heads=16,
-                       bottleneck_dim=256, in_context_len=32, in_context_start=10, patch_size=32, **kwargs)
-
-
-JiT_models = {
-    'JiT-B/16': JiT_B_16,
-    'JiT-B/32': JiT_B_32,
-    'JiT-L/16': JiT_L_16,
-    'JiT-L/32': JiT_L_32,
-    'JiT-H/16': JiT_H_16,
-    'JiT-H/32': JiT_H_32,
-    'JiT_CondImg-B/16': JiT_CondImg_B_16,
-    'JiT_CondImg-B/32': JiT_CondImg_B_32,
-    'JiT_CondImg-L/16': JiT_CondImg_L_16,
-    'JiT_CondImg-L/32': JiT_CondImg_L_32,
-    'JiT_CondImg-H/16': JiT_CondImg_H_16,
-    'JiT_CondImg-H/32': JiT_CondImg_H_32,
-}

@@ -1,4 +1,5 @@
 import argparse
+import ast
 import contextlib
 import datetime
 import os
@@ -15,7 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from denoiser import Denoiser
-from engine_jit import compute_dice_score, compute_hausdorff_distance_95, compute_iou_score, compute_sensitivity, compute_specificity, save_metrics_to_csv
+from engine_jit import compute_aji, compute_cldice, compute_dice_score, compute_hausdorff_distance_95, compute_iou_score, compute_sensitivity, compute_specificity, save_metrics_to_csv
 from util.isicdataset import ISICSegmentationDataset, SameSizeBatchSampler, get_isic_transform
 from util.monudataset import MoNuSegmentationDataset, get_monu_transform
 from util.octadataset import OCTASegmentationDataset, get_octa_transform
@@ -25,12 +26,15 @@ def get_args_parser():
     parser = argparse.ArgumentParser("JiT inference", add_help=False)
 
     # architecture
-    parser.add_argument("--model", default="JiT-B/16", type=str, metavar="MODEL")
+    parser.add_argument("--model", default="JiT-B/16",
+                        type=str, metavar="MODEL")
     parser.add_argument("--img_size", default=256, type=int)
     parser.add_argument("--attn_dropout", type=float, default=0.0)
     parser.add_argument("--proj_dropout", type=float, default=0.0)
     parser.add_argument("--img_channel", type=int, default=3)
     parser.add_argument("--mask_channel", type=int, default=1)
+    parser.add_argument('--cond_weight', type=str, default=None,
+                        help='Weight configs for cond, low_cond, high_cond')
 
     # sampling
     parser.add_argument("--sampling_method", default="heun", type=str)
@@ -39,6 +43,7 @@ def get_args_parser():
     parser.add_argument("--interval_min", default=0.0, type=float)
     parser.add_argument("--interval_max", default=1.0, type=float)
     parser.add_argument("--soft_vote", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--num_samples", default=1, type=int, help="Number of samples for ensemble averaging")
 
     # noise params
     parser.add_argument("--P_mean", default=-0.8, type=float)
@@ -52,25 +57,32 @@ def get_args_parser():
     parser.add_argument("--ema_decay2", default=0.9996, type=float)
 
     # io
-    parser.add_argument("--dataset", default="OCTA500_6M", type=str, help="Dataset name")
-    parser.add_argument("--data_path", default="data", type=str, help="Path to images or dataset split")
-    parser.add_argument("--checkpoint", required=True, type=str, help="Path to checkpoint (.pth)")
+    parser.add_argument("--dataset", default="OCTA500_6M",
+                        type=str, help="Dataset name")
+    parser.add_argument("--data_path", default="data",
+                        type=str, help="Path to images or dataset split")
+    parser.add_argument("--checkpoint", required=True,
+                        type=str, help="Path to checkpoint (.pth)")
     parser.add_argument("--output_dir", default="outputs", type=str)
     parser.add_argument("--batch_size", default=8, type=int)
     parser.add_argument("--num_workers", default=4, type=int)
     parser.add_argument("--device", default="cuda", type=str)
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--same_size_batch", action="store_true")
+    parser.add_argument("--add_loss", action="store_true")
+    parser.add_argument("--add_loss_name", default="aux_loss", type=str)
+    parser.add_argument("--add_loss_weight", default=1.0, type=float)
 
     # patch sampling
     parser.add_argument("--samp_patch_size", default=256, type=int)
     parser.add_argument("--stride", default=128, type=int)
 
     # inference options
-    parser.add_argument("--ema", default="ema1", choices=["none", "ema1", "ema2"], type=str)
+    parser.add_argument("--ema", default="ema1",
+                        choices=["none", "ema1", "ema2"], type=str)
     parser.add_argument("--threshold", default=0.5, type=float)
-    parser.add_argument("--metrics", action="store_true", help="Compute metrics if labels exist")
-
+    parser.add_argument("--metrics", action="store_true",
+                        help="Compute metrics if labels exist")
     return parser
 
 
@@ -125,8 +137,10 @@ def _reconstruct_from_patches(
     if len(orig_shape) == 2:
         orig_shape = (1, orig_shape[0], orig_shape[1])
     c, h, w = orig_shape
-    vote_sum = torch.zeros((c, h, w), device=patches.device, dtype=torch.float32)
-    vote_count = torch.zeros((h, w), device=patches.device, dtype=torch.float32)
+    vote_sum = torch.zeros(
+        (c, h, w), device=patches.device, dtype=torch.float32)
+    vote_count = torch.zeros(
+        (h, w), device=patches.device, dtype=torch.float32)
 
     # Hard voting: threshold patches at 0.5 first, then accumulate votes
     for patch, (top, left) in zip(patches, positions):
@@ -197,16 +211,35 @@ def _log(message: str, log_path: Path | None = None):
 
 
 def main(args):
+    if isinstance(args.cond_weight, str):
+        try:
+            args.cond_weight = ast.literal_eval(args.cond_weight)
+        except Exception:
+            pass
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     device = torch.device(args.device)
 
-    output_dir = os.path.join(args.output_dir, f"{args.model.replace('/', '-')}-{args.dataset}")
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    cond_weight_str = ""
+    if args.cond_weight is not None:
+        try:
+            c = args.cond_weight.get('cond', 'fixed')[0]
+            l = args.cond_weight.get('low_cond', 'fixed')[0]
+            h = args.cond_weight.get('high_cond', 'fixed')[0]
+            cond_weight_str = f"-{c}{l}{h}"
+        except Exception:
+            pass
+    else:
+        cond_weight_str = ""
+
+    output_dir = os.path.join(args.output_dir, f"{args.model.replace('/', '-')}{cond_weight_str}-{args.dataset}{f'-{args.add_loss_name}' if args.add_loss else ''}")
+    if not os.path.exists(output_dir):
+        raise ValueError(f"output_dir does not exist: {output_dir}. Please run training first to generate checkpoints and create the output directory.")
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = Path(args.output_dir, "logs")
-    log_path = log_dir / f"training_{timestamp}.log"
+    log_path = log_dir / f"inference_{timestamp}.log"
 
     _log("[1/4] Build dataset and dataloader", log_path)
 
@@ -276,6 +309,28 @@ def main(args):
     model.to(device)
     model.eval()
 
+    # Print the cond_w configurations
+    net = model.net if hasattr(model, 'net') else getattr(model, 'module', model).net
+    _log("\n[Condition Weights]", log_path)
+    if hasattr(net, 'cond_weight'):
+        _log(f"Config: {net.cond_weight}", log_path)
+    if hasattr(net, 'shared_cond_w'):
+        _log(f"shared_cond_w: {net.shared_cond_w.mean().item():.4f}", log_path)
+    if hasattr(net, 'shared_low_cond_w'):
+        _log(f"shared_low_cond_w: {net.shared_low_cond_w.mean().item():.4f}", log_path)
+    if hasattr(net, 'shared_high_cond_w'):
+        _log(f"shared_high_cond_w: {net.shared_high_cond_w.mean().item():.4f}", log_path)
+
+    if hasattr(net, 'blocks') and len(net.blocks) > 0:
+        first_block = net.blocks[0]
+        if hasattr(first_block, 'cond_mode') and first_block.cond_mode in ['learnable', 'zero_init']:
+            _log(f"block[0].cond_w: {first_block.cond_w.mean().item():.4f} (mode: {first_block.cond_mode})", log_path)
+        if hasattr(first_block, 'low_cond_mode') and first_block.low_cond_mode in ['learnable', 'zero_init']:
+            _log(f"block[0].low_cond_w: {first_block.low_cond_w.mean().item():.4f} (mode: {first_block.low_cond_mode})", log_path)
+        if hasattr(first_block, 'high_cond_mode') and first_block.high_cond_mode in ['learnable', 'zero_init']:
+            _log(f"block[0].high_cond_w: {first_block.high_cond_w.mean().item():.4f} (mode: {first_block.high_cond_mode})", log_path)
+    _log("", log_path)
+
     autocast_ctx = (
         torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
         if device.type == "cuda"
@@ -287,9 +342,11 @@ def main(args):
     sensitivity_scores = []
     specificity_scores = []
     hd95_scores = []
+    aji_scores = []
+    cldice_scores = []
     sample_idx = 0
 
-    image_dir = Path(output_dir, f"images-{epoch}{'-softvote' if args.soft_vote else ''}" if epoch is not None else "images")
+    image_dir = Path(output_dir, f"images-{epoch}{'-softvote' if args.soft_vote else ''}{f'-multi-{args.num_samples}' if args.num_samples > 1 else ''}" if epoch is not None else "images")
     _log(f"Saving results to {image_dir}", log_path)
     intermediates_dir = image_dir / "intermediates"
     os.makedirs(image_dir, exist_ok=True)
@@ -312,10 +369,18 @@ def main(args):
                     batch_patches = patches[i:i + args.batch_size].to(device, non_blocking=True)
                     batch_patches = batch_patches * 2.0 - 1.0
 
-                    with autocast_ctx:
-                        patch_preds, intermediates = model.generate(batch_patches)
-
-                    all_patch_preds.append(patch_preds.cpu())
+                    batch_sum_preds = None
+                    for _ in range(args.num_samples):
+                        with autocast_ctx:
+                            patch_preds, _ = model.generate(batch_patches)
+                        
+                        if batch_sum_preds is None:
+                            batch_sum_preds = patch_preds.cpu().float()
+                        else:
+                            batch_sum_preds += patch_preds.cpu().float()
+                    
+                    batch_avg_preds = batch_sum_preds / args.num_samples
+                    all_patch_preds.append(batch_avg_preds)
 
                 all_patch_preds = torch.cat(all_patch_preds, dim=0)
 
@@ -333,7 +398,7 @@ def main(args):
                 rel_name = f"sample_{sample_idx:03d}"
                 save_mask = partial(_save_mask, output_dir=image_dir, rel_name=rel_name, threshold=args.threshold, epoch=epoch)
                 save_mask(data=full_pred, postfix="_prob")
-                save_mask(data=full_pred_binary,  postfix="_pred", is_binary=True)
+                save_mask(data=full_pred_binary, postfix="_pred", is_binary=True)
                 save_mask(data=image, postfix="_image")
                 save_mask(data=gt, postfix="_gt", is_binary=True)
                 # Save intermediate masks for the few samples
@@ -348,13 +413,16 @@ def main(args):
                     sensitivity_scores.append(compute_sensitivity(pred_single, gt_single, threshold=args.threshold))
                     specificity_scores.append(compute_specificity(pred_single, gt_single, threshold=args.threshold))
                     hd95_scores.append(compute_hausdorff_distance_95(pred_single, gt_single, threshold=args.threshold))
+                    if 'ISIC' in args.dataset:
+                        aji_scores.append(compute_aji(pred_single, gt_single, threshold=args.threshold))
+                    if 'OCTA' in args.dataset:
+                        cldice_scores.append(compute_cldice(pred_single, gt_single, threshold=args.threshold))
 
                 sample_idx += 1
 
     if args.metrics and dice_scores:
         _log("[4/4] Save metrics", log_path)
-        save_metrics_to_csv(output_dir, epoch, dice_scores, iou_scores,
-                            sensitivity_scores, specificity_scores, hd95_scores, args.soft_vote)
+        save_metrics_to_csv(output_dir, epoch, dice_scores, iou_scores, sensitivity_scores, specificity_scores, hd95_scores, aji_scores, cldice_scores, args.soft_vote, dataset=args.dataset)
 
 
 if __name__ == "__main__":

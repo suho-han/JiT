@@ -5,14 +5,13 @@
 
 from math import pi
 
-import torch
-from torch import nn
 import numpy as np
-
+import torch
 from einops import rearrange, repeat
+from torch import nn
 
 
-def broadcat(tensors, dim = -1):
+def broadcat(tensors, dim=-1):
     num_tensors = len(tensors)
     shape_lens = set(list(map(lambda t: len(t.shape), tensors)))
     assert len(shape_lens) == 1, 'tensors must all have the same number of dimensions'
@@ -26,13 +25,13 @@ def broadcat(tensors, dim = -1):
     expanded_dims.insert(dim, (dim, dims[dim]))
     expandable_shapes = list(zip(*map(lambda t: t[1], expanded_dims)))
     tensors = list(map(lambda t: t[0].expand(*t[1]), zip(tensors, expandable_shapes)))
-    return torch.cat(tensors, dim = dim)
+    return torch.cat(tensors, dim=dim)
 
 
 def rotate_half(x):
-    x = rearrange(x, '... (d r) -> ... d r', r = 2)
-    x1, x2 = x.unbind(dim = -1)
-    x = torch.stack((-x2, x1), dim = -1)
+    x = rearrange(x, '... (d r) -> ... d r', r=2)
+    x1, x2 = x.unbind(dim=-1)
+    x = torch.stack((-x2, x1), dim=-1)
     return rearrange(x, '... d r -> ... (d r)')
 
 
@@ -42,11 +41,11 @@ class VisionRotaryEmbedding(nn.Module):
         dim,
         pt_seq_len,
         ft_seq_len=None,
-        custom_freqs = None,
-        freqs_for = 'lang',
-        theta = 10000,
-        max_freq = 10,
-        num_freqs = 1,
+        custom_freqs=None,
+        freqs_for='lang',
+        theta=10000,
+        max_freq=10,
+        num_freqs=1,
     ):
         super().__init__()
         if custom_freqs:
@@ -60,27 +59,28 @@ class VisionRotaryEmbedding(nn.Module):
         else:
             raise ValueError(f'unknown modality {freqs_for}')
 
-        if ft_seq_len is None: ft_seq_len = pt_seq_len
+        if ft_seq_len is None:
+            ft_seq_len = pt_seq_len
         t = torch.arange(ft_seq_len) / ft_seq_len * pt_seq_len
 
         freqs_h = torch.einsum('..., f -> ... f', t, freqs)
-        freqs_h = repeat(freqs_h, '... n -> ... (n r)', r = 2)
+        freqs_h = repeat(freqs_h, '... n -> ... (n r)', r=2)
 
         freqs_w = torch.einsum('..., f -> ... f', t, freqs)
-        freqs_w = repeat(freqs_w, '... n -> ... (n r)', r = 2)
+        freqs_w = repeat(freqs_w, '... n -> ... (n r)', r=2)
 
-        freqs = broadcat((freqs_h[:, None, :], freqs_w[None, :, :]), dim = -1)
+        freqs = broadcat((freqs_h[:, None, :], freqs_w[None, :, :]), dim=-1)
 
         self.register_buffer("freqs_cos", freqs.cos())
         self.register_buffer("freqs_sin", freqs.sin())
 
-    def forward(self, t, start_index = 0):
+    def forward(self, t, start_index=0):
         rot_dim = self.freqs_cos.shape[-1]
         end_index = start_index + rot_dim
         assert rot_dim <= t.shape[-1], f'feature dimension {t.shape[-1]} is not of sufficient size to rotate in all the positions {rot_dim}'
         t_left, t, t_right = t[..., :start_index], t[..., start_index:end_index], t[..., end_index:]
         t = (t * self.freqs_cos) + (rotate_half(t) * self.freqs_sin)
-        return torch.cat((t_left, t, t_right), dim = -1)
+        return torch.cat((t_left, t, t_right), dim=-1)
 
 
 class VisionRotaryEmbeddingFast(nn.Module):
@@ -89,12 +89,12 @@ class VisionRotaryEmbeddingFast(nn.Module):
         dim,
         pt_seq_len=16,
         ft_seq_len=None,
-        custom_freqs = None,
-        freqs_for = 'lang',
-        theta = 10000,
-        max_freq = 10,
-        num_freqs = 1,
-        num_cls_token = 0
+        custom_freqs=None,
+        freqs_for='lang',
+        theta=10000,
+        max_freq=10,
+        num_freqs=1,
+        num_cls_token=0
     ):
         super().__init__()
         if custom_freqs:
@@ -108,12 +108,13 @@ class VisionRotaryEmbeddingFast(nn.Module):
         else:
             raise ValueError(f'unknown modality {freqs_for}')
 
-        if ft_seq_len is None: ft_seq_len = pt_seq_len
+        if ft_seq_len is None:
+            ft_seq_len = pt_seq_len
         t = torch.arange(ft_seq_len) / ft_seq_len * pt_seq_len
 
         freqs = torch.einsum('..., f -> ... f', t, freqs)
-        freqs = repeat(freqs, '... n -> ... (n r)', r = 2)
-        freqs = broadcat((freqs[:, None, :], freqs[None, :, :]), dim = -1)
+        freqs = repeat(freqs, '... n -> ... (n r)', r=2)
+        freqs = broadcat((freqs[:, None, :], freqs[None, :, :]), dim=-1)
 
         if num_cls_token > 0:
             freqs_flat = freqs.view(-1, freqs.shape[-1])  # [N_img, D]
@@ -125,13 +126,25 @@ class VisionRotaryEmbeddingFast(nn.Module):
             cos_pad = torch.ones(num_cls_token, D, dtype=cos_img.dtype, device=cos_img.device)
             sin_pad = torch.zeros(num_cls_token, D, dtype=sin_img.dtype, device=sin_img.device)
 
-            self.freqs_cos = torch.cat([cos_pad, cos_img], dim=0).cuda()  # [N_cls+N_img, D]
-            self.freqs_sin = torch.cat([sin_pad, sin_img], dim=0).cuda()
+            self.register_buffer(
+                "freqs_cos",
+                torch.cat([cos_pad, cos_img], dim=0),
+            )  # [N_cls+N_img, D]
+            self.register_buffer(
+                "freqs_sin",
+                torch.cat([sin_pad, sin_img], dim=0),
+            )
         else:
-            self.freqs_cos = freqs.cos().view(-1, freqs.shape[-1]).cuda()
-            self.freqs_sin = freqs.sin().view(-1, freqs.shape[-1]).cuda()
+            self.register_buffer(
+                "freqs_cos",
+                freqs.cos().view(-1, freqs.shape[-1]),
+            )
+            self.register_buffer(
+                "freqs_sin",
+                freqs.sin().view(-1, freqs.shape[-1]),
+            )
 
-    def forward(self, t): return  t * self.freqs_cos + rotate_half(t) * self.freqs_sin
+    def forward(self, t): return t * self.freqs_cos + rotate_half(t) * self.freqs_sin
 
 
 class RMSNorm(nn.Module):
@@ -176,7 +189,7 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
     emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
 
-    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
+    emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
     return emb
 
 
@@ -194,8 +207,8 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     pos = pos.reshape(-1)  # (M,)
     out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
 
-    emb_sin = np.sin(out) # (M, D/2)
-    emb_cos = np.cos(out) # (M, D/2)
+    emb_sin = np.sin(out)  # (M, D/2)
+    emb_cos = np.cos(out)  # (M, D/2)
 
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb

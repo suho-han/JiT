@@ -15,6 +15,7 @@ from torchvision.transforms import functional as F
 Sequence = collections.abc.Sequence
 Iterable = collections.abc.Iterable
 
+
 class Compose(object):
     def __init__(self, transforms):
         self.transforms = transforms
@@ -30,24 +31,25 @@ class ToTensor(object):
         # Convert PIL images to tensors
         img = torch.from_numpy(np.array(img)).float()
         mask = torch.from_numpy(np.array(mask)).float()
-        
+
         # Add channel dimension if grayscale (H, W) -> (1, H, W)
         if img.ndim == 2:
             img = img.unsqueeze(0)
         elif img.ndim == 3:
             img = img.permute(2, 0, 1)
-            
+
         if mask.ndim == 2:
             mask = mask.unsqueeze(0)
         elif mask.ndim == 3:
             mask = mask.permute(2, 0, 1)
-        
+
         # Normalize to [0, 1] range
         img = img / 255.0
         mask = mask / 255.0
-            
+
         return img, mask
-    
+
+
 class ToPILImage(object):
     def __init__(self, mode=None):
         self.mode = mode
@@ -65,6 +67,7 @@ class Normalize(object):
     def __call__(self, img, mask):
         return F.normalize(img, self.mean, self.std, self.inplace), mask
 
+
 class Resize(object):
     def __init__(self, size, interpolation=Image.BICUBIC, do_mask=True):
         assert isinstance(size, int) or (isinstance(size, Iterable) and len(size) == 2)
@@ -74,9 +77,10 @@ class Resize(object):
 
     def __call__(self, img, mask):
         if self.do_mask:
-            return F.resize(img, self.size, self.interpolation), F.resize(mask, self.size, Image.NEAREST)
+            return F.resize(img, self.size, self.interpolation), F.resize(mask, self.size, self.interpolation)
         else:
             return F.resize(img, self.size, self.interpolation), mask
+
 
 class Lambda_image(object):
     def __init__(self, lambd):
@@ -85,7 +89,8 @@ class Lambda_image(object):
 
     def __call__(self, img, mask):
         return self.lambd(img), mask
-    
+
+
 class RandomCrop(object):
     def __init__(self, size, padding=None, pad_if_needed=False, fill=0, padding_mode='constant'):
         if isinstance(size, numbers.Number):
@@ -142,7 +147,8 @@ class RandomVerticalFlip(object):
         if random.random() < self.p:
             return F.vflip(img), F.vflip(mask)
         return img, mask
-    
+
+
 class ColorJitter(object):
     def __init__(self, brightness=0, contrast=0, saturation=0, hue=0):
         self.brightness = self._check_input(brightness, 'brightness')
@@ -226,7 +232,7 @@ class RandomRotation(object):
         angle = self.get_params(self.degrees)
 
         return F.rotate(img, angle, interpolation=Image.BICUBIC, expand=self.expand, center=self.center), \
-               F.rotate(mask, angle, interpolation=Image.BICUBIC, expand=self.expand, center=self.center)
+            F.rotate(mask, angle, interpolation=Image.BICUBIC, expand=self.expand, center=self.center)
 
 
 class RandomAffine(object):
@@ -297,4 +303,4 @@ class RandomAffine(object):
     def __call__(self, img, mask):
         ret = self.get_params(self.degrees, self.translate, self.scale, self.shear, img.size)
         return F.affine(img, *ret, interpolation=Image.BICUBIC, fill=self.fillcolor), \
-               F.affine(mask, *ret, interpolation=Image.BICUBIC, fill=self.fillcolor)
+            F.affine(mask, *ret, interpolation=Image.BICUBIC, fill=self.fillcolor)
