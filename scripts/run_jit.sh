@@ -57,8 +57,12 @@ if [ -n "$PARSED_CW" ]; then COND_WEIGHT_ARGS=(--cond_weight "$PARSED_CW"); fi
 NUM_GPUS=$(echo "$DEVICE" | tr ',' '\n' | wc -l)
 
 echo "Starting training: $DATASET / $MODEL / $EPOCH epochs / GPUs $DEVICE"
+echo "Add loss: ${ADD_LOSS_ARGS[*]}"
+echo "Cond weight: ${COND_WEIGHT_ARGS[*]}"
+echo "Online eval: $ONLINE_EVAL"
 
-uv run torchrun --nproc_per_node="$NUM_GPUS" --master_port=29502 \
+MASTER_PORT=$((29000 + RANDOM % 1000))
+uv run torchrun --nproc_per_node="$NUM_GPUS" --master_port="$MASTER_PORT" \
     src/main_jit.py \
     --model "$MODEL" \
     --proj_dropout 0.0 \

@@ -73,6 +73,8 @@ class ResultRow:
     step: int
     metrics: Dict[str, str]
     patch_size: str = ""  # e.g., '16' or '32'
+    add_loss: str = "--"
+    cond_weight: str = "--"
 
 
 METRIC_ORDER = ["Dice", "IoU", "Sensitivity", "Specificity", "HD95"]
@@ -112,8 +114,8 @@ def render_latex_table_content(rows: List[ResultRow], caption: str) -> str:
     if "clDice" in available_metrics:
         metric_order.append("clDice")
 
-    headers = ["Model", "Step"] + metric_order
-    column_spec = "c" * len(headers)
+    headers = ["Model", "Add Loss", "Cond Weight", "Step"] + metric_order
+    column_spec = "l" + "c" * (len(headers) - 1)
     metric_ranks: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
     for metric in metric_order:
         values = [
@@ -147,6 +149,8 @@ def render_latex_table_content(rows: List[ResultRow], caption: str) -> str:
             lines.append("                \\midrule")
         values = [
             format_model_name(row.model),
+            row.add_loss.replace("_", r"\_"),
+            row.cond_weight.replace("_", r"\_"),
             str(row.step),
         ]
         for metric in metric_order:
@@ -297,22 +301,22 @@ def make_average_results_table() -> None:
         folder_name = os.path.basename(os.path.dirname(path))
 
         loss_suffix_match = re.search(r"-([a-z0-9_]+)$", folder_name)
-        loss_suffix = None
+        add_loss = "--"
         if loss_suffix_match and loss_suffix_match.group(1) in {"dice_bce"}:
-            loss_suffix = loss_suffix_match.group(1)
+            add_loss = loss_suffix_match.group(1)
             folder_name = folder_name[:loss_suffix_match.start()]
 
         # Check if the folder contains a cond_weight string (e.g. -ffs, -lfs, etc)
         # Assuming cond_weight string is exactly 3 lowercase letters surrounded by hyphens
         cond_match = re.search(r"-([a-z]{3})-(?!.*-[a-z]{3}-)", folder_name)
 
+        cond_weight = "--"
         if cond_match:
             # Reconstruct model and dataset around the matched cond_weight string
             model = folder_name[:cond_match.start()]
             dataset = folder_name[cond_match.end():]
 
-            # Append the cond_weight string back to the model name so it shows up in the table
-            model = f"{model}-{cond_match.group(1)}"
+            cond_weight = cond_match.group(1)
             model = model.replace("_", "-")
         else:
             # Fallback to old logic
@@ -332,12 +336,9 @@ def make_average_results_table() -> None:
                 model = "-".join(parts[:-1]).replace("_", "-")
                 dataset = parts[-1]
 
-        if loss_suffix:
-            model = f"{model}/{loss_suffix}"
-
-        # Extract patch size from model name (e.g., "JiT-B-16" or "JiT-B-16-ffs" -> patch_size="16")
+        # Extract patch size from model name (e.g., "JiT-B-16")
         patch_size = ""
-        match_patch = re.search(r"-(\d+)(?:-[a-z]{3}|/[a-z0-9_]+)?$", model)
+        match_patch = re.search(r"-(\d+)$", model)
         if match_patch:
             patch_size = match_patch.group(1)
 
@@ -349,6 +350,8 @@ def make_average_results_table() -> None:
                 step=step,
                 metrics=metrics,
                 patch_size=patch_size,
+                add_loss=add_loss,
+                cond_weight=cond_weight,
             )
         )
 

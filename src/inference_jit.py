@@ -372,13 +372,13 @@ def main(args):
                     batch_sum_preds = None
                     for _ in range(args.num_samples):
                         with autocast_ctx:
-                            patch_preds, _ = model.generate(batch_patches)
-                        
+                            patch_preds, intermediates = model.generate(batch_patches)
+
                         if batch_sum_preds is None:
                             batch_sum_preds = patch_preds.cpu().float()
                         else:
                             batch_sum_preds += patch_preds.cpu().float()
-                    
+
                     batch_avg_preds = batch_sum_preds / args.num_samples
                     all_patch_preds.append(batch_avg_preds)
 

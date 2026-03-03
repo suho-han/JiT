@@ -45,6 +45,9 @@ PARSED_CW=$(parse_cond_weight "$COND_WEIGHT")
 if [ -n "$PARSED_CW" ]; then COND_WEIGHT_ARGS=(--cond_weight "$PARSED_CW"); fi
 
 echo "Starting inference: $DATASET / $MODEL / step $STEP / ensemble $NUM_SAMPLES"
+echo "Add loss: ${ADD_LOSS_ARGS[*]}"
+echo "Cond weight: ${COND_WEIGHT_ARGS[*]}"
+echo "Online eval: $ONLINE_EVAL"
 
 uv run python src/inference_jit.py \
     --model "$MODEL" --checkpoint "$CHECKPOINT" \
