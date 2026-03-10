@@ -55,26 +55,23 @@ def calculate(images_dir, output_dir, dataset, epoch=None, threshold=0.5, soft_v
             cldice_scores.append(compute_cldice(pred, gt, threshold=threshold))
 
     if dice_scores:
-        save_metrics_to_csv(output_dir, epoch, dice_scores, iou_scores,
-                            sensitivity_scores, specificity_scores, hd95_scores,
+        save_metrics_to_csv(output_dir, epoch,
+                            dice_scores, iou_scores, sensitivity_scores, specificity_scores, hd95_scores,
                             aji_scores if 'ISIC' in dataset else None,
                             cldice_scores if 'OCTA' in dataset else None,
-                            soft_vote, dataset)
+                            args)
 
 
 if __name__ == "__main__":
     exps = [d for d in os.listdir('outputs') if args.dataset in d]
     if args.model:
         exps = [d for d in exps if args.model in d]
-    if args.size:
-        exps = [d for d in exps if f"-{args.size}-" in d]
 
     print_msg = f"Evaluating on dataset: {args.dataset}"
     if args.model:
         print_msg += f", model: {args.model}"
-    if args.size:
-        print_msg += f", size: {args.size}"
     print(print_msg)
+    args.soft_vote = None
 
     for exp in exps:
         base_dir = os.path.join('outputs', exp)

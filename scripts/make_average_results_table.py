@@ -363,14 +363,14 @@ def make_average_results_table() -> None:
         logger.error("==================================\n")
 
     if not steps:
-        max_steps: Dict[Tuple[str, str], int] = {}
+        max_steps: Dict[Tuple[str, str, str, str], int] = {}
         for row in rows:
-            key = (row.model, row.dataset)
+            key = (row.model, row.dataset, row.add_loss, row.cond_weight)
             max_steps[key] = max(row.step, max_steps.get(key, row.step))
         rows = [
             row
             for row in rows
-            if row.step == max_steps.get((row.model, row.dataset))
+            if row.step == max_steps.get((row.model, row.dataset, row.add_loss, row.cond_weight))
         ]
     elif steps:
         step_set = set(steps)
@@ -395,22 +395,21 @@ def make_average_results_table() -> None:
         patch_sizes = patch_sizes if patch_sizes else [""]
 
         group_order = {
-            "jit": 0,
-            "condimg": 1,
-            "paracond": 2,
-            "paracondwave": 3,
-            "condimgwave": 4,
+            "jit": 1,
+            "condimg": 2,
+            "paracond": 3,
+            "paracondwave": 4,
             "other": 5,
         }
 
         def model_size_rank(model: str) -> int:
             lowered = model.lower()
             if "-b-" in lowered or lowered.endswith("-b"):
-                return 0
-            if "-l-" in lowered or lowered.endswith("-l"):
                 return 1
-            if "-h-" in lowered or lowered.endswith("-h"):
+            if "-l-" in lowered or lowered.endswith("-l"):
                 return 2
+            if "-h-" in lowered or lowered.endswith("-h"):
+                return 3
             return 99
 
         # Collect all table contents
@@ -431,6 +430,9 @@ def make_average_results_table() -> None:
                     group_order.get(r.group, 99),
                     model_size_rank(r.model),
                     r.model,
+                    0 if r.add_loss == "--" else 1,
+                    r.add_loss,
+                    r.cond_weight,
                     r.step,
                 )
             )

@@ -2,12 +2,12 @@
 set -e
 
 # OCTA segmentation training refactored
-# Usage: uv run bash scripts/run_jit.sh <dataset> <model> <device> [add_loss] [cond_weight] [epoch]
+# Usage: bash scripts/run_jit.sh <dataset> <model> <device> [add_loss] [cond_weight] [epoch]
 
 if [[ "$1" == "-h" || "$1" == "--help" ]]; then
-    echo "Usage: uv run bash scripts/run_jit.sh <dataset> <model> <device> [add_loss] [cond_weight] [epoch]"
+    echo "Usage: bash scripts/run_jit.sh <dataset> <model> <device> [add_loss] [cond_weight] [epoch]"
     echo ""
-    echo "Example: uv run bash scripts/run_jit.sh OCTA500_6M JiT-B/16 3 weighted_dice_bce fff"
+    echo "Example: bash scripts/run_jit.sh OCTA500_6M JiT-B/16 3 weighted_dice_bce fff"
     exit 0
 fi
 
@@ -41,9 +41,9 @@ if [ -z "$EPOCH" ]; then
         JiT-B/*) EPOCH=10000 ;;
         JiT-L/*) EPOCH=20000 ;;
         JiT-H/*) EPOCH=40000 ;;
-        JiT_CondImg-B/* | JiT_ParaCond-B/* | JiT_ParaCondWave-B/*) EPOCH=30000 ;;
-        JiT_CondImg-L/* | JiT_ParaCond-L/* | JiT_ParaCondWave-L/*) EPOCH=50000 ;;
-        JiT_CondImg-H/* | JiT_ParaCond-H/* | JiT_ParaCondWave-H/*) EPOCH=80000 ;;
+        JiT_CondImg-B/* | JiT_ParaCond-B/* | JiT_ParaCondFiLM-B/* | JiT_ParaCondWave-B/* | JiT_ParaCondWaveFix-B/*) EPOCH=30000 ;;
+        JiT_CondImg-L/* | JiT_ParaCond-L/* | JiT_ParaCondFiLM-L/* | JiT_ParaCondWave-L/* | JiT_ParaCondWaveFix-L/*) EPOCH=50000 ;;
+        JiT_CondImg-H/* | JiT_ParaCond-H/* | JiT_ParaCondFiLM-H/* | JiT_ParaCondWave-H/* | JiT_ParaCondWaveFix-H/*) EPOCH=80000 ;;
         *) echo "Unknown model: $MODEL"; exit 1 ;;
     esac
 fi

@@ -24,16 +24,13 @@ class BottleneckPatchEmbed(nn.Module):
         super().__init__()
         img_size = (img_size, img_size)
         patch_size = (patch_size, patch_size)
-        num_patches = (img_size[1] // patch_size[1]) * \
-            (img_size[0] // patch_size[0])
+        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
 
-        self.proj1 = nn.Conv2d(
-            in_chans, pca_dim, kernel_size=patch_size, stride=patch_size, bias=False)
-        self.proj2 = nn.Conv2d(
-            pca_dim, embed_dim, kernel_size=1, stride=1, bias=bias)
+        self.proj1 = nn.Conv2d(in_chans, pca_dim, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.proj2 = nn.Conv2d(pca_dim, embed_dim, kernel_size=1, stride=1, bias=bias)
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -61,23 +58,18 @@ class TimestepEmbedder(nn.Module):
     def timestep_embedding(t, dim, max_period=10000):
         """
         Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
+        :param t: a 1-D Tensor of N indices, one per batch element. These may be fractional.
         :param dim: the dimension of the output.
         :param max_period: controls the minimum frequency of the embeddings.
         :return: an (N, D) Tensor of positional embeddings.
         """
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
         half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0,
-                                                 end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
+        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(device=t.device)
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat(
-                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
     def forward(self, t):
@@ -115,8 +107,7 @@ class Attention(nn.Module):
 
     def forward(self, x, rope):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C //
-                                  self.num_heads).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         # make torchscript happy (cannot use tensor as tuple)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
@@ -153,10 +144,8 @@ class CrossAttention(nn.Module):
 
     def forward(self, x, cond, rope=None):
         B, N, C = x.shape
-        q = self.q(x).reshape(B, N, self.num_heads, C //
-                              self.num_heads).permute(0, 2, 1, 3)
-        kv = self.kv(cond).reshape(
-            B, cond.shape[1], 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        kv = self.kv(cond).reshape(B, cond.shape[1], 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         k, v = kv[0], kv[1]
 
         q = self.q_norm(q)
@@ -166,8 +155,7 @@ class CrossAttention(nn.Module):
             q = rope(q)
             k = rope(k)
 
-        x = scaled_dot_product_attention(
-            q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
+        x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
         x = x.transpose(1, 2).reshape(B, N, C)
 
         x = self.proj(x)
@@ -231,11 +219,9 @@ class JiTBlock(nn.Module):
             self.cond_w = nn.Parameter(torch.zeros(1))
 
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True,
-                              qk_norm=True, attn_drop=attn_drop, proj_drop=proj_drop)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True, attn_drop=attn_drop, proj_drop=proj_drop)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
-        self.cross_attn = CrossAttention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
-                                         attn_drop=attn_drop, proj_drop=proj_drop)
+        self.cross_attn = CrossAttention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True, attn_drop=attn_drop, proj_drop=proj_drop)
         self.norm3 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
@@ -244,7 +230,7 @@ class JiTBlock(nn.Module):
             nn.Linear(hidden_size, 9 * hidden_size, bias=True)
         )
 
-    @torch.compile
+    # @torch.compile
     def forward(self, x, c, cond, feat_rope=None, shared_cond_w=None):
         shift_msa, scale_msa, gate_msa, shift_cond, scale_cond, gate_cond, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(9, dim=-1)

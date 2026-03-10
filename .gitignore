@@ -6,7 +6,7 @@ outputs/
 pretrained/
 tests/test_outputs/
 .env
-paper/
+papers/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -223,4 +223,7 @@ marimo/_lsp/
 __marimo__/
 
 # Streamlit
-.streamlit/secrets.toml
+.streamlit/secrets.toml.env
+.mcp.json
+CLAUDE.md
+PROJECT_CONTEXT.md

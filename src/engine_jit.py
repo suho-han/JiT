@@ -492,7 +492,7 @@ def validation(model_without_ddp, data_loader, device, epoch, log_writer=None, t
 def save_metrics_to_csv(output_dir, epoch,
                         dice_scores, iou_scores, sensitivity_scores, specificity_scores,
                         hd95_scores, aji_scores, cldice_scores,
-                        soft_vote, dataset=None):
+                        args):
     """
     Save individual and average metrics to CSV files.
 
@@ -506,8 +506,7 @@ def save_metrics_to_csv(output_dir, epoch,
         hd95_scores: List of HD95 scores for each sample
         aji_scores: List of AJI scores for each sample
         cldice_scores: List of clDice scores for each sample
-        soft_vote: Whether this evaluation was done with soft voting (affects filename)
-        dataset: Dataset name
+        args: Arguments containing soft_vote and dataset information
     """
     # Calculate averages
     avg_dice = np.mean(dice_scores)
@@ -515,24 +514,24 @@ def save_metrics_to_csv(output_dir, epoch,
     avg_sensitivity = np.mean(sensitivity_scores)
     avg_specificity = np.mean(specificity_scores)
     avg_hd95 = np.mean(hd95_scores)
-    if dataset and 'ISIC' in dataset and aji_scores is not None:
+    if args.dataset and 'ISIC' in args.dataset and aji_scores is not None:
         avg_aji = np.mean(aji_scores)
     else:
         avg_aji = None
-    if dataset and 'OCTA500' in dataset and cldice_scores is not None:
+    if args.dataset and 'OCTA500' in args.dataset and cldice_scores is not None:
         avg_cldice = np.mean(cldice_scores)
     else:
         avg_cldice = None
 
     # Save individual results to CSV
     results_csv_path = os.path.join(
-        output_dir, f"results-{epoch}{'-soft_vote' if soft_vote else ''}.csv")
+        output_dir, f"results-{epoch}{'-soft_vote' if args.soft_vote else ''}.csv")
     with open(results_csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        if dataset and 'ISIC' in dataset and aji_scores is not None:
+        if args.dataset and 'ISIC' in args.dataset and aji_scores is not None:
             writer.writerow(
                 ['Sample', 'Dice', 'IoU', 'Sensitivity', 'Specificity', 'HD95', 'AJI'])
-        elif dataset and 'OCTA500' in dataset and cldice_scores is not None:
+        elif args.dataset and 'OCTA500' in args.dataset and cldice_scores is not None:
             writer.writerow(
                 ['Sample', 'Dice', 'IoU', 'Sensitivity', 'Specificity', 'HD95', 'clDice'])
         else:
@@ -547,16 +546,16 @@ def save_metrics_to_csv(output_dir, epoch,
                 f"{specificity_scores[i]:.4f}",
                 f"{hd95_scores[i]:.4f}"
             ]
-            if dataset and 'ISIC' in dataset and aji_scores is not None:
+            if args.dataset and 'ISIC' in args.dataset and aji_scores is not None:
                 row.append(f"{aji_scores[i]:.4f}")
-            if dataset and 'OCTA500' in dataset and cldice_scores is not None:
+            if args.dataset and 'OCTA500' in args.dataset and cldice_scores is not None:
                 row.append(f"{cldice_scores[i]:.4f}")
             writer.writerow(row)
     print(f"Individual results saved to {results_csv_path}")
 
     # Save average results to CSV
     avg_csv_path = os.path.join(
-        output_dir, f"average_results-{epoch}{'-soft_vote' if soft_vote else ''}.csv")
+        output_dir, f"average_results-{epoch}{'-soft_vote' if args.soft_vote else ''}.csv")
     with open(avg_csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['Metric', 'Value'])
@@ -565,8 +564,8 @@ def save_metrics_to_csv(output_dir, epoch,
         writer.writerow(['Sensitivity', f"{avg_sensitivity:.4f}"])
         writer.writerow(['Specificity', f"{avg_specificity:.4f}"])
         writer.writerow(['HD95', f"{avg_hd95:.4f}"])
-        if dataset and 'ISIC' in dataset and avg_aji is not None:
+        if args.dataset and 'ISIC' in args.dataset and avg_aji is not None:
             writer.writerow(['AJI', f"{avg_aji:.4f}"])
-        if dataset and 'OCTA500' in dataset and avg_cldice is not None:
+        if args.dataset and 'OCTA500' in args.dataset and avg_cldice is not None:
             writer.writerow(['clDice', f"{avg_cldice:.4f}"])
     print(f"Average results saved to {avg_csv_path}")

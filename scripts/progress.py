@@ -13,6 +13,39 @@ from typing import Dict, List, Optional, Tuple
 NO_STEP_VALUE = "N/A"
 
 
+def format_markdown_table(headers: List[str], rows: List[List[str]]) -> List[str]:
+    """Format a markdown table with columns padded to fit the content."""
+    if not headers and not rows:
+        return []
+
+    # Calculate max widths
+    max_widths = [max(len(str(h)), 3) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            if i < len(max_widths):
+                max_widths[i] = max(max_widths[i], len(str(cell)))
+            else:
+                max_widths.append(max(len(str(cell)), 3))
+
+    lines = []
+
+    # Header
+    header_str = "| " + " | ".join(str(h).ljust(w) for h, w in zip(headers, max_widths)) + " |"
+    lines.append(header_str)
+
+    # Separator
+    sep_str = "| " + " | ".join("-" * w for w in max_widths) + " |"
+    lines.append(sep_str)
+
+    # Rows
+    for row in rows:
+        row_padded = list(row) + [""] * (len(headers) - len(row))
+        row_str = "| " + " | ".join(str(c).ljust(w) for c, w in zip(row_padded, max_widths)) + " |"
+        lines.append(row_str)
+
+    return lines
+
+
 def append_blank_line(lines: List[str]) -> None:
     """Append a blank line only when the previous line is not blank."""
     if lines and lines[-1] != "":
@@ -339,8 +372,9 @@ def main():
     lines = []
     lines.append("# Running JiT processes")
     lines.append("")
-    lines.append("|GPU|PID|Dataset|Model|Process|GPU Memory|Epochs|Loss Name|Details|")
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+
+    headers_proc = ["GPU", "PID", "Dataset", "Model", "Process", "GPU Memory", "Epochs", "Loss Name", "Log File"]
+    rows_proc = []
 
     row_count = 0
 
@@ -382,8 +416,6 @@ def main():
         if not add_loss_name:
             add_loss_name = "-"
 
-        details = build_details(cmd_tokens)
-
         dataset = dataset or "-"
         model = model or "-"
         display_model = format_model_name(model)
@@ -397,12 +429,29 @@ def main():
         variant_key = "default" if add_loss_name == "-" else add_loss_name
         training_info[f"{dataset}|{model_key}|{variant_key}"] = f"GPU {gpu_index}|{pid}"
 
-        lines.append(
-            f"|{gpu_index}|{pid}|{dataset}|{display_model}|{process_label}|{gpu_mem}|{epochs}|{add_loss_name}|{details}|")
+        # Get log file path
+        inferred_dir = model.replace("/", "-")
+        if cond_suffix:
+            inferred_dir += f"-{cond_suffix}"
+        if dataset != "-":
+            inferred_dir += f"-{dataset}"
+        if add_loss_name != "-":
+            inferred_dir += f"-{add_loss_name}"
+
+        logs_path = Path("outputs") / inferred_dir / "logs"
+        log_file = "-"
+        if logs_path.exists():
+            log_files = sorted(logs_path.glob("*.log"))
+            if log_files:
+                log_file = str(log_files[-1])
+
+        rows_proc.append([gpu_index, pid, dataset, display_model, process_label, gpu_mem, epochs, add_loss_name, log_file])
         row_count += 1
 
     if row_count == 0:
-        lines.append("|-|-|-|-|-|-|-|-|No matching processes|")
+        rows_proc.append(["-", "-", "-", "-", "-", "-", "-", "-", "No matching processes"])
+
+    lines.extend(format_markdown_table(headers_proc, rows_proc))
 
     append_blank_line(lines)
     lines.append("## JiT checkpoint steps")
@@ -410,14 +459,12 @@ def main():
 
     # Find JiT directories
     outputs_dir = Path("outputs")
-    jit_dirs = sorted(outputs_dir.glob("JiT*/")
-                      ) if outputs_dir.exists() else []
+    jit_dirs = sorted(outputs_dir.glob("JiT*/")) if outputs_dir.exists() else []
     data_dir = Path("data")
-    dataset_candidates = [d.name for d in data_dir.iterdir()
-                          if d.is_dir()] if data_dir.exists() else []
+    dataset_candidates = [d.name for d in data_dir.iterdir() if d.is_dir()] if data_dir.exists() else []
 
     if not jit_dirs:
-        lines.append("|-|-|N/A|")
+        lines.extend(format_markdown_table(["Model", "Add Loss", "Cond Weight", "Max Step", "Training", "PID"], [["-", "-", "-", "N/A", "-", "-"]]))
     else:
         jit_sorted = sort_run_dirs([str(d) for d in jit_dirs])
 
@@ -428,13 +475,11 @@ def main():
         for run_dir in jit_sorted:
             run_name = Path(run_dir).name
 
-            model_name, dataset_name, variant_name = extract_model_dataset_and_variant(
-                run_name, dataset_candidates)
+            model_name, dataset_name, variant_name = extract_model_dataset_and_variant(run_name, dataset_candidates)
 
             max_step = max_checkpoint_step(run_dir)
             model_key = model_name.replace("/", "-")
-            training_info_val = training_info.get(
-                f"{dataset_name}|{model_key}|{variant_name}", "-")
+            training_info_val = training_info.get(f"{dataset_name}|{model_key}|{variant_name}", "-")
 
             training_gpu = "-"
             training_pid = "-"
@@ -449,44 +494,83 @@ def main():
 
             if dataset_name not in dataset_rows:
                 dataset_rows[dataset_name] = []
-            dataset_rows[dataset_name].append(
-                (variant_name, model_name, max_step, training_gpu, training_pid))
-
+            dataset_rows[dataset_name].append((variant_name, model_name, max_step, training_gpu, training_pid))
         if datasets:
             for dataset_name in sorted(datasets):
                 append_blank_line(lines)
                 lines.append(f"### {dataset_name}")
-                append_blank_line(lines)
-                variant_groups = {}
-                for variant_name, model_name, max_step, training_gpu, training_pid in dataset_rows[dataset_name]:
-                    if variant_name not in variant_groups:
-                        variant_groups[variant_name] = []
-                    variant_groups[variant_name].append(
-                        (model_name, max_step, training_gpu, training_pid))
 
-                ordered_variants = []
-                if "default" in variant_groups:
-                    ordered_variants.append("default")
-                if "dice_bce" in variant_groups:
-                    ordered_variants.append("dice_bce")
-                for variant_name in sorted(variant_groups.keys()):
-                    if variant_name not in ordered_variants:
-                        ordered_variants.append(variant_name)
+                # Group by patch size
+                patch_groups = {}
+                for item in dataset_rows[dataset_name]:
+                    model_name = item[1]
+                    display_model = format_model_name(model_name)
+                    match = re.search(r"/(\d+)", display_model)
+                    patch_size = match.group(1) if match else "16"
+                    if patch_size not in patch_groups:
+                        patch_groups[patch_size] = []
+                    patch_groups[patch_size].append(item)
 
-                for variant_index, variant_name in enumerate(ordered_variants):
-                    heading = "default" if variant_name == "default" else variant_name
-                    lines.append(f"#### {heading} - {dataset_name}")
+                for patch_size in sorted(patch_groups.keys()):
                     append_blank_line(lines)
-                    lines.append("|Model|Max Step|Training|PID|")
-                    lines.append("|---|---|---|---|")
+                    lines.append(f"#### Patch {patch_size}")
+                    append_blank_line(lines)
 
-                    for model_name, max_step, training_gpu, training_pid in variant_groups[variant_name]:
+                    headers_steps = ["Model", "Add Loss", "Cond Weight", "Max Step", "Training", "PID"]
+                    rows_steps = []
+
+                    def sort_key(item):
+                        variant_name, model_name, max_step, training_gpu, training_pid = item
+
+                        if "ParaCondWave" in model_name:
+                            prefix_key = 4
+                        elif "ParaCond" in model_name:
+                            prefix_key = 3
+                        elif "CondImg" in model_name:
+                            prefix_key = 2
+                        else:
+                            prefix_key = 1
+
+                        size_key = 9
+                        formatted_model = format_model_name(model_name)
+                        if "-B/" in formatted_model or "-B-" in formatted_model:
+                            size_key = 1
+                        elif "-L/" in formatted_model or "-L-" in formatted_model:
+                            size_key = 2
+                        elif "-H/" in formatted_model or "-H-" in formatted_model:
+                            size_key = 3
+
+                        cond_weight = ""
+                        base_model = formatted_model
+                        match = re.search(r"-([a-z]{3})$", formatted_model)
+                        if match:
+                            cond_weight = match.group(1)
+                            base_model = formatted_model[:match.start()]
+
+                        v_key = 0 if variant_name == "default" else 1
+
+                        return (prefix_key, size_key, base_model, v_key, variant_name, cond_weight)
+
+                    sorted_rows = sorted(patch_groups[patch_size], key=sort_key)
+
+                    for variant_name, model_name, max_step, training_gpu, training_pid in sorted_rows:
                         display_model = format_model_name(model_name)
-                        lines.append(
-                            f"|{display_model}|{max_step}|{training_gpu}|{training_pid}|")
 
-                    if variant_index < len(ordered_variants) - 1:
-                        append_blank_line(lines)
+                        # Extract cond_weight suffix if present in model_name
+                        # Format is usually 'JiT_ParaCondWave-H-16-lll'
+                        cond_weight = "--"
+
+                        # Assume cond_weight is 3 lowercase letters separated by hyphen
+                        match = re.search(r"-([a-z]{3})$", display_model)
+                        if match:
+                            cond_weight = match.group(1)
+                            display_model = display_model[:match.start()]
+
+                        add_loss = "--" if variant_name == "default" else variant_name
+
+                        rows_steps.append([display_model, add_loss, cond_weight, max_step, training_gpu, training_pid])
+
+                    lines.extend(format_markdown_table(headers_steps, rows_steps))
 
     # Write to file
     with open(output_file, "w") as f:

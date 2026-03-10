@@ -2,11 +2,11 @@
 set -e
 
 # OCTA segmentation inference refactored
-# Usage: uv run bash scripts/test.sh <dataset> <model> <step> <device> [num_samples] [add_loss] [cond_weight] [soft_vote] [batch_size]
+# Usage: bash scripts/test.sh <dataset> <model> <step> <device> [add_loss] [cond_weight] [soft_vote] [batch_size]
 
 if [[ "$1" == "-h" || "$1" == "--help" ]]; then
-    echo "Usage: uv run bash scripts/test.sh <dataset> <model> <step> <device> [num_samples] [add_loss] [cond_weight] [soft_vote] [batch_size]"
-    echo "Example: uv run bash scripts/test.sh OCTA500_6M JiT-B/16 10000 0 5 weighted_dice_bce fff True 16"
+    echo "Usage: bash scripts/test.sh <dataset> <model> <step> <device> [add_loss] [cond_weight] [soft_vote] [batch_size]"
+    echo "Example: bash scripts/test.sh OCTA500_6M JiT-B/16 10000 0 weighted_dice_bce fff True 16"
     exit 0
 fi
 
@@ -17,11 +17,10 @@ DATASET=${1:-OCTA500_6M}
 MODEL=${2:-JiT-B/16}
 STEP=${3:-last}
 DEVICE=${4:-0}
-NUM_SAMPLES=${5:-1}
-ADD_LOSS=${6:-""}
-COND_WEIGHT=${7:-""}
-SOFT=${8:-False}
-BS=${9:-4}
+ADD_LOSS=${5:-""}
+COND_WEIGHT=${6:-""}
+SOFT=${7:-False}
+BS=${8:-4}
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$DEVICE}
 
@@ -44,7 +43,7 @@ ADD_LOSS_ARGS=($(get_loss_args "$ADD_LOSS"))
 PARSED_CW=$(parse_cond_weight "$COND_WEIGHT")
 if [ -n "$PARSED_CW" ]; then COND_WEIGHT_ARGS=(--cond_weight "$PARSED_CW"); fi
 
-echo "Starting inference: $DATASET / $MODEL / step $STEP / ensemble $NUM_SAMPLES"
+echo "Starting inference: $DATASET / $MODEL / step $STEP"
 echo "Add loss: ${ADD_LOSS_ARGS[*]}"
 echo "Cond weight: ${COND_WEIGHT_ARGS[*]}"
 echo "Online eval: $ONLINE_EVAL"
@@ -55,7 +54,7 @@ uv run python src/inference_jit.py \
     --batch_size "$BS" --num_workers 0 --img_size "$IMG_SIZE" \
     --img_channel "$IMG_CHANNEL" --mask_channel "$MASK_CHANNEL" \
     --samp_patch_size "$SAMP_PATCH_SIZE" --stride "$SAMP_PATCH_SIZE" \
-    --num_samples "$NUM_SAMPLES" --metrics "${SOFT_ARGS[@]}" \
+    --metrics "${SOFT_ARGS[@]}" \
     "${ADD_LOSS_ARGS[@]}" "${COND_WEIGHT_ARGS[@]}"
 
 uv run python scripts/alert.py --repo jit --message "${DATASET} segmentation inference completed ${MODEL} @ epoch ${STEP}"

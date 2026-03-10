@@ -3,7 +3,9 @@ import autorootcwd
 from src.models.JiT import JiT
 from src.models.JiT_condimg import JiT_CondImg
 from src.models.JiT_paracond import JiT_ParaCond
+from src.models.JiT_paracondfilm import JiT_ParaCondFiLM
 from src.models.JiT_paracondwave import JiT_ParaCondWave
+from src.models.JiT_paracondwavefix import JiT_ParaCondWaveFix
 
 _BASE_SPECS = {
     "B": {"depth": 12, "hidden_size": 768, "num_heads": 12, "bottleneck_dim": 128},
@@ -105,6 +107,36 @@ def JiT_ParaCond_H_32(**kwargs):
                         bottleneck_dim=256, in_context_len=0, in_context_start=0, patch_size=32, **kwargs)
 
 
+def JiT_ParaCondFiLM_B_16(**kwargs):
+    return JiT_ParaCondFiLM(depth=12, hidden_size=768, num_heads=12,
+                            bottleneck_dim=128, in_context_len=0, in_context_start=0, patch_size=16, **kwargs)
+
+
+def JiT_ParaCondFiLM_B_32(**kwargs):
+    return JiT_ParaCondFiLM(depth=12, hidden_size=768, num_heads=12,
+                            bottleneck_dim=128, in_context_len=0, in_context_start=0, patch_size=32, **kwargs)
+
+
+def JiT_ParaCondFiLM_L_16(**kwargs):
+    return JiT_ParaCondFiLM(depth=24, hidden_size=1024, num_heads=16,
+                            bottleneck_dim=128, in_context_len=0, in_context_start=0, patch_size=16, **kwargs)
+
+
+def JiT_ParaCondFiLM_L_32(**kwargs):
+    return JiT_ParaCondFiLM(depth=24, hidden_size=1024, num_heads=16,
+                            bottleneck_dim=128, in_context_len=0, in_context_start=0, patch_size=32, **kwargs)
+
+
+def JiT_ParaCondFiLM_H_16(**kwargs):
+    return JiT_ParaCondFiLM(depth=32, hidden_size=1280, num_heads=16,
+                            bottleneck_dim=256, in_context_len=0, in_context_start=0, patch_size=16, **kwargs)
+
+
+def JiT_ParaCondFiLM_H_32(**kwargs):
+    return JiT_ParaCondFiLM(depth=32, hidden_size=1280, num_heads=16,
+                            bottleneck_dim=256, in_context_len=0, in_context_start=0, patch_size=32, **kwargs)
+
+
 def JiT_ParaCondWave_B_16(**kwargs):
     return JiT_ParaCondWave(depth=12, hidden_size=768, num_heads=12,
                             bottleneck_dim=128, in_context_len=0, in_context_start=0, patch_size=16, **kwargs)
@@ -135,6 +167,36 @@ def JiT_ParaCondWave_H_32(**kwargs):
                             bottleneck_dim=256, in_context_len=0, in_context_start=0, patch_size=32, **kwargs)
 
 
+def JiT_ParaCondWaveFix_B_16(**kwargs):
+    return JiT_ParaCondWaveFix(depth=12, hidden_size=768, num_heads=12,
+                               bottleneck_dim=128, in_context_len=0, in_context_start=0, patch_size=16, **kwargs)
+
+
+def JiT_ParaCondWaveFix_B_32(**kwargs):
+    return JiT_ParaCondWaveFix(depth=12, hidden_size=768, num_heads=12,
+                               bottleneck_dim=128, in_context_len=0, in_context_start=0, patch_size=32, **kwargs)
+
+
+def JiT_ParaCondWaveFix_L_16(**kwargs):
+    return JiT_ParaCondWaveFix(depth=24, hidden_size=1024, num_heads=16,
+                               bottleneck_dim=128, in_context_len=0, in_context_start=0, patch_size=16, **kwargs)
+
+
+def JiT_ParaCondWaveFix_L_32(**kwargs):
+    return JiT_ParaCondWaveFix(depth=24, hidden_size=1024, num_heads=16,
+                               bottleneck_dim=128, in_context_len=0, in_context_start=0, patch_size=32, **kwargs)
+
+
+def JiT_ParaCondWaveFix_H_16(**kwargs):
+    return JiT_ParaCondWaveFix(depth=32, hidden_size=1280, num_heads=16,
+                               bottleneck_dim=256, in_context_len=0, in_context_start=0, patch_size=16, **kwargs)
+
+
+def JiT_ParaCondWaveFix_H_32(**kwargs):
+    return JiT_ParaCondWaveFix(depth=32, hidden_size=1280, num_heads=16,
+                               bottleneck_dim=256, in_context_len=0, in_context_start=0, patch_size=32, **kwargs)
+
+
 JiT_models = {
     'JiT-B/16': JiT_B_16,
     'JiT-B/32': JiT_B_32,
@@ -154,10 +216,22 @@ JiT_models = {
     'JiT_ParaCond-L/32': JiT_ParaCond_L_32,
     'JiT_ParaCond-H/16': JiT_ParaCond_H_16,
     'JiT_ParaCond-H/32': JiT_ParaCond_H_32,
+    'JiT_ParaCondFiLM-B/16': JiT_ParaCondFiLM_B_16,
+    'JiT_ParaCondFiLM-B/32': JiT_ParaCondFiLM_B_32,
+    'JiT_ParaCondFiLM-L/16': JiT_ParaCondFiLM_L_16,
+    'JiT_ParaCondFiLM-L/32': JiT_ParaCondFiLM_L_32,
+    'JiT_ParaCondFiLM-H/16': JiT_ParaCondFiLM_H_16,
+    'JiT_ParaCondFiLM-H/32': JiT_ParaCondFiLM_H_32,
     'JiT_ParaCondWave-B/16': JiT_ParaCondWave_B_16,
     'JiT_ParaCondWave-B/32': JiT_ParaCondWave_B_32,
     'JiT_ParaCondWave-L/16': JiT_ParaCondWave_L_16,
     'JiT_ParaCondWave-L/32': JiT_ParaCondWave_L_32,
     'JiT_ParaCondWave-H/16': JiT_ParaCondWave_H_16,
     'JiT_ParaCondWave-H/32': JiT_ParaCondWave_H_32,
+    'JiT_ParaCondWaveFix-B/16': JiT_ParaCondWaveFix_B_16,
+    'JiT_ParaCondWaveFix-B/32': JiT_ParaCondWaveFix_B_32,
+    'JiT_ParaCondWaveFix-L/16': JiT_ParaCondWaveFix_L_16,
+    'JiT_ParaCondWaveFix-L/32': JiT_ParaCondWaveFix_L_32,
+    'JiT_ParaCondWaveFix-H/16': JiT_ParaCondWaveFix_H_16,
+    'JiT_ParaCondWaveFix-H/32': JiT_ParaCondWaveFix_H_32,
 }

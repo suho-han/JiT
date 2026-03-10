@@ -43,7 +43,6 @@ def get_args_parser():
     parser.add_argument("--interval_min", default=0.0, type=float)
     parser.add_argument("--interval_max", default=1.0, type=float)
     parser.add_argument("--soft_vote", action=argparse.BooleanOptionalAction)
-    parser.add_argument("--num_samples", default=1, type=int, help="Number of samples for ensemble averaging")
 
     # noise params
     parser.add_argument("--P_mean", default=-0.8, type=float)
@@ -217,8 +216,16 @@ def main(args):
         except Exception:
             pass
 
-    torch.manual_seed(args.seed)
+    import random
+    random.seed(args.seed)
     np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)  # 멀티 GPU 환경 등 모든 GPU에 시드 고정
+
+    # CuDNN 관련 재현성 (완벽하게 동일한 결과를 위한 설정)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     device = torch.device(args.device)
 
@@ -346,7 +353,7 @@ def main(args):
     cldice_scores = []
     sample_idx = 0
 
-    image_dir = Path(output_dir, f"images-{epoch}{'-softvote' if args.soft_vote else ''}{f'-multi-{args.num_samples}' if args.num_samples > 1 else ''}" if epoch is not None else "images")
+    image_dir = Path(output_dir, f"images-{epoch}{'-softvote' if args.soft_vote else ''}" if epoch is not None else "images")
     _log(f"Saving results to {image_dir}", log_path)
     intermediates_dir = image_dir / "intermediates"
     os.makedirs(image_dir, exist_ok=True)
@@ -369,18 +376,18 @@ def main(args):
                     batch_patches = patches[i:i + args.batch_size].to(device, non_blocking=True)
                     batch_patches = batch_patches * 2.0 - 1.0
 
-                    batch_sum_preds = None
-                    for _ in range(args.num_samples):
-                        with autocast_ctx:
-                            patch_preds, intermediates = model.generate(batch_patches)
+                    # sample_idx를 사용하여 전체 이미지에 대해 고유한 시드를 보장하고,
+                    # 곱하기를 사용하여 idx, i 간의 합이 우연히 겹치지 않도록 방지합니다.
+                    seed = args.seed + sample_idx * 10000 + i * 10
+                    torch.manual_seed(seed)
+                    torch.cuda.manual_seed(seed)
+                    with autocast_ctx:
+                        bs = batch_patches.size(0)
+                        sample_image_size = batch_patches.size(2)
+                        z_init = model.noise_scale * torch.randn(bs, model.net.in_channels, sample_image_size, sample_image_size, device=device)
+                        patch_preds, intermediates = model.generate(batch_patches, z=z_init)
 
-                        if batch_sum_preds is None:
-                            batch_sum_preds = patch_preds.cpu().float()
-                        else:
-                            batch_sum_preds += patch_preds.cpu().float()
-
-                    batch_avg_preds = batch_sum_preds / args.num_samples
-                    all_patch_preds.append(batch_avg_preds)
+                    all_patch_preds.append(patch_preds.cpu().float())
 
                 all_patch_preds = torch.cat(all_patch_preds, dim=0)
 
@@ -422,7 +429,8 @@ def main(args):
 
     if args.metrics and dice_scores:
         _log("[4/4] Save metrics", log_path)
-        save_metrics_to_csv(output_dir, epoch, dice_scores, iou_scores, sensitivity_scores, specificity_scores, hd95_scores, aji_scores, cldice_scores, args.soft_vote, dataset=args.dataset)
+        save_metrics_to_csv(output_dir, epoch,
+                            dice_scores, iou_scores, sensitivity_scores, specificity_scores, hd95_scores, aji_scores, cldice_scores, args)
 
 
 if __name__ == "__main__":
